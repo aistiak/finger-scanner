@@ -3,10 +3,17 @@ from tkinter import ttk, messagebox, font
 import requests
 import json
 import base64
+import io
 from datetime import datetime
 import threading
 import sys
 import os
+
+try:
+    from PIL import Image, ImageTk
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 
 # Add parent directory to path to import fingerprint modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -67,49 +74,35 @@ class FingerprintApp:
         
         # Title
         title_label = ttk.Label(main_container, text="Fingerprint Registration", style='Title.TLabel')
-        title_label.pack(pady=(0, 20))
+        title_label.pack(pady=(0, 10))
         
-        # Passport search section
-        search_frame = ttk.LabelFrame(main_container, text="Passport Search", padding=15)
-        search_frame.pack(fill='x', pady=(0, 20))
-        
-        # Passport number input
-        passport_label = ttk.Label(search_frame, text="Passport Number:", style='Heading.TLabel')
-        passport_label.pack(anchor='w', pady=(0, 5))
-        
-        passport_input_frame = ttk.Frame(search_frame)
-        passport_input_frame.pack(fill='x', pady=(0, 10))
-        
-        self.passport_entry = ttk.Entry(passport_input_frame, font=('Arial', 12), width=20)
-        self.passport_entry.pack(side='left', padx=(0, 10))
-        
-        self.search_btn = ttk.Button(passport_input_frame, text="Search", command=self.search_passport)
-        self.search_btn.pack(side='left')
-        
-        # Loading indicator
-        self.loading_label = ttk.Label(search_frame, text="", style='Info.TLabel')
-        self.loading_label.pack(anchor='w', pady=(5, 0))
-        
-        # User details section
-        self.details_frame = ttk.LabelFrame(main_container, text="User Details", padding=15)
-        self.details_frame.pack(fill='both', expand=True, pady=(0, 20))
-        
-        # Initially hide details frame
-        self.details_frame.pack_forget()
-        
-        # Fingerprint registration section
-        fingerprint_frame = ttk.LabelFrame(main_container, text="Fingerprint Registration", padding=15)
-        fingerprint_frame.pack(fill='x')
-        
-        self.register_fp_btn = ttk.Button(fingerprint_frame, text="Register Fingerprint", 
+        # Compact top bar: Search + Register side by side
+        top_frame = ttk.LabelFrame(main_container, text="Search & Register", padding=10)
+        top_frame.pack(fill='x', pady=(0, 10))
+        row1 = ttk.Frame(top_frame)
+        row1.pack(fill='x')
+        ttk.Label(row1, text="Passport Number:", style='Heading.TLabel').pack(side='left', padx=(0, 5))
+        self.passport_entry = ttk.Entry(row1, font=('Arial', 12), width=18)
+        self.passport_entry.pack(side='left', padx=(0, 8))
+        self.search_btn = ttk.Button(row1, text="Search", command=self.search_passport)
+        self.search_btn.pack(side='left', padx=(0, 15))
+        self.register_fp_btn = ttk.Button(row1, text="Register Fingerprint",
                                          command=self.register_fingerprint, state='disabled')
-        self.register_fp_btn.pack(pady=10)
-        
-        self.register_status_label = ttk.Label(fingerprint_frame, text="", style='Info.TLabel')
-        self.register_status_label.pack(pady=(5, 0))
-        
-        # Store user data
+        self.register_fp_btn.pack(side='left', padx=(0, 8))
+        self.cancel_register_btn = ttk.Button(row1, text="Cancel", command=self._cancel_registration)
+        self.cancel_register_btn.pack(side='left')
+        self.cancel_register_btn.pack_forget()
+        self.loading_label = ttk.Label(top_frame, text="", style='Info.TLabel')
+        self.loading_label.pack(anchor='w', pady=(6, 0))
+        self.register_status_label = ttk.Label(top_frame, text="", style='Info.TLabel')
+        self.register_status_label.pack(anchor='w', pady=(2, 0))
+        self.registration_cancelled = False
         self.current_user_data = None
+        
+        # User details section (gets most of the space)
+        self.details_frame = ttk.LabelFrame(main_container, text="User Details", padding=15)
+        self.details_frame.pack(fill='both', expand=True, pady=(0, 0))
+        self.details_frame.pack_forget()
         
     def create_match_tab(self):
         """Create the matching tab"""
@@ -337,47 +330,17 @@ Settings are automatically saved to your local machine.
         self.current_user_data = None
         
     def _display_user_details(self, user_data):
-        """Display user details in a beautiful format"""
-        # Clear previous details
+        """Display user details with left (details) and right (photo/emoji) layout"""
         for widget in self.details_frame.winfo_children():
             widget.destroy()
-            
-        # Show details frame with limited height
         self.details_frame.pack(fill='x', pady=(0, 20))
-        
-        # Create frame for canvas and scrollbar
-        scroll_frame = ttk.Frame(self.details_frame)
-        scroll_frame.pack(fill='both', expand=True, padx=10, pady=10)
-        
-        # Create canvas and scrollbar for scrolling
-        canvas = tk.Canvas(scroll_frame, height=250, bg='#f8f9fa')
-        scrollbar = ttk.Scrollbar(scroll_frame, orient='vertical', command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        # Enable mouse wheel scrolling
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
-        
-        # Pack canvas and scrollbar
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        
-        # Create details container inside scrollable frame
-        details_container = scrollable_frame
-        
-        # Personal Information
+        details_container, _ = self._build_details_with_photo(self.details_frame, user_data, is_match_tab=False)
+        self._fill_detail_sections(details_container, user_data)
+
+    def _fill_detail_sections(self, details_container, user_data):
+        """Fill personal, fingerprint, service, and location sections into details_container."""
         personal_frame = ttk.LabelFrame(details_container, text="Personal Information", padding=10)
         personal_frame.pack(fill='x', pady=(0, 10))
-        
         self._add_detail_row(personal_frame, "Full Name:", user_data.get('full_name', 'N/A'))
         self._add_detail_row(personal_frame, "Passport Number:", user_data.get('passport_number', 'N/A'))
         self._add_detail_row(personal_frame, "Phone:", user_data.get('phone', 'N/A'))
@@ -388,38 +351,26 @@ Settings are automatically saved to your local machine.
         self._add_detail_row(personal_frame, "Profession:", user_data.get('profession', 'N/A'))
         self._add_detail_row(personal_frame, "Religion:", user_data.get('religion', 'N/A'))
         self._add_detail_row(personal_frame, "Address:", user_data.get('address', 'N/A'))
-        
-        # Fingerprint Status Section (show first for importance)
         fingerprint_info = user_data.get('fingerprint', {})
         fp_status_frame = ttk.LabelFrame(details_container, text="Fingerprint Status", padding=10)
         fp_status_frame.pack(fill='x', pady=(0, 10))
-        
         is_registered = fingerprint_info.get('registered', False)
         has_template = fingerprint_info.get('has_template', False)
-        
         status_text = "✅ Registered" if is_registered else "❌ Not Registered"
         template_text = "✅ Template Available" if has_template else "❌ No Template"
-        
         self._add_detail_row(fp_status_frame, "Registration Status:", status_text)
         self._add_detail_row(fp_status_frame, "Template Status:", template_text)
-        
-        # Service Information
         service_frame = ttk.LabelFrame(details_container, text="Service Information", padding=10)
         service_frame.pack(fill='x', pady=(0, 10))
-        
         self._add_detail_row(service_frame, "Amount:", f"৳{user_data.get('amount', 0)}")
         self._add_detail_row(service_frame, "Delivery Date:", self._format_date(user_data.get('delivery_date')))
-        
-        # Branch and Country Information
         if user_data.get('branch') or user_data.get('country'):
             location_frame = ttk.LabelFrame(details_container, text="Location Information", padding=10)
             location_frame.pack(fill='x', pady=(0, 10))
-            
             if user_data.get('branch'):
                 branch = user_data['branch']
                 self._add_detail_row(location_frame, "Branch Name:", branch.get('name', 'N/A'))
                 self._add_detail_row(location_frame, "Branch Address:", branch.get('address', 'N/A'))
-                
             if user_data.get('country'):
                 country = user_data['country']
                 self._add_detail_row(location_frame, "Country:", country.get('name', 'N/A'))
@@ -445,7 +396,80 @@ Settings are automatically saved to your local machine.
             return date_obj.strftime('%B %d, %Y')
         except:
             return date_str
-            
+
+    def _get_user_photo_or_emoji(self, user_data):
+        """
+        Get user photo from data.user (or data) as URL or base64.
+        Returns (photo_image_for_tk, emoji_fallback).
+        If photo is available: (PhotoImage, None). If not: (None, '👨' or '👩').
+        """
+        gender = (user_data.get('gender') or '').lower()
+        emoji = '👩' if gender == 'female' else '👨'
+        photo_source = None
+        user_obj = user_data.get('user') or {}
+        for key in ('photo', 'image', 'image_url', 'avatar'):
+            if user_obj.get(key):
+                photo_source = user_obj.get(key)
+                break
+        if not photo_source:
+            photo_source = user_data.get('photo') or user_data.get('image') or user_data.get('image_url')
+        if not photo_source or not HAS_PIL:
+            return None, emoji
+        try:
+            if isinstance(photo_source, str) and photo_source.startswith(('http://', 'https://')):
+                r = requests.get(photo_source, timeout=5)
+                r.raise_for_status()
+                img = Image.open(io.BytesIO(r.content))
+            else:
+                # Assume base64
+                raw = base64.b64decode(photo_source)
+                img = Image.open(io.BytesIO(raw))
+            img = img.convert('RGB')
+            img.thumbnail((140, 180), Image.Resampling.LANCZOS)
+            return ImageTk.PhotoImage(img), None
+        except Exception:
+            return None, emoji
+
+    def _build_details_with_photo(self, parent_frame, user_data, is_match_tab=False):
+        """
+        Build two-column layout: left = scrollable details, right = photo or emoji.
+        Returns (details_container for adding rows, right_frame, photo_ref to keep).
+        """
+        # Outer horizontal split: left = details (shrink to content), right = photo (no gap)
+        content = ttk.Frame(parent_frame)
+        content.pack(fill='both', expand=True, padx=5, pady=5)
+        left_panel = ttk.Frame(content)
+        left_panel.pack(side='left', fill='y', expand=False)
+        right_panel = ttk.Frame(content)
+        right_panel.pack(side='left', padx=(10, 0), pady=10)
+        # Right side: fixed size placeholder for photo/emoji
+        photo_frame = ttk.LabelFrame(right_panel, text="Photo", padding=8)
+        photo_frame.pack()
+        photo_ref = [None]  # keep ref so PhotoImage is not garbage-collected
+        photo_image, emoji = self._get_user_photo_or_emoji(user_data)
+        if photo_image:
+            photo_ref[0] = photo_image
+            lbl = ttk.Label(photo_frame, image=photo_image)
+            lbl.pack()
+        else:
+            lbl = tk.Label(photo_frame, text=emoji, font=('Segoe UI Emoji', 72), bg='#f8f9fa', fg='#495057')
+            lbl.pack(padx=10, pady=10)
+        # Left: scrollable details (no horizontal expand so no grey gap)
+        scroll_frame = ttk.Frame(left_panel)
+        scroll_frame.pack(fill='y', expand=False)
+        canvas = tk.Canvas(scroll_frame, height=360, bg='#f8f9fa')
+        scrollbar = ttk.Scrollbar(scroll_frame, orient='vertical', command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        scrollbar.pack(side='left', fill='y')
+        canvas.pack(side='left', fill='y', expand=False)
+        return scrollable_frame, photo_ref
+
     def register_fingerprint(self):
         """Register fingerprint for the current user"""
         if not self.current_user_data:
@@ -466,15 +490,20 @@ Settings are automatically saved to your local machine.
             if not result:
                 return
             
+        self.registration_cancelled = False
         self.register_fp_btn.configure(state='disabled')
+        self.cancel_register_btn.pack(side='left')
         status_text = "Re-registering fingerprint..." if is_registered else "Registering fingerprint..."
-        self.register_status_label.configure(text=f"{status_text} Please follow scanner instructions.", 
+        self.register_status_label.configure(text=f"{status_text} Please follow scanner instructions.",
                                            style='Info.TLabel')
-        
-        # Run fingerprint registration in separate thread
         thread = threading.Thread(target=self._register_fingerprint_thread)
         thread.daemon = True
         thread.start()
+
+    def _cancel_registration(self):
+        """Set flag so registration thread can exit; UI is updated by the thread or on next check."""
+        self.registration_cancelled = True
+        self.register_status_label.configure(text="Cancelling...", style='Info.TLabel')
         
     def _register_fingerprint_thread(self):
         """Register fingerprint in separate thread"""
@@ -496,21 +525,31 @@ Settings are automatically saved to your local machine.
             
             # Update GUI: Device ready
             self.root.after(0, self._update_registration_status, "✅ Device connected successfully")
-            
-            # Capture 3 samples
+            if self.registration_cancelled:
+                zkfp2.Terminate()
+                self.root.after(0, self._fingerprint_registration_cancelled)
+                return
             templates = []
             for i in range(3):
-                # Update GUI: Waiting for finger placement
-                self.root.after(0, self._update_registration_status, f"👆 Place finger {i+1}/3 - Waiting for finger on scanner...")
-                
+                if self.registration_cancelled:
+                    zkfp2.Terminate()
+                    self.root.after(0, self._fingerprint_registration_cancelled)
+                    return
+                self.root.after(0, self._update_registration_status, f"👆 Place finger {i+1}/3 - Waiting for finger on scanner... (Cancel to abort)")
                 while True:
+                    if self.registration_cancelled:
+                        zkfp2.Terminate()
+                        self.root.after(0, self._fingerprint_registration_cancelled)
+                        return
                     capture = zkfp2.AcquireFingerprint()
                     if capture:
                         templates.append(capture[0])
-                        # Update GUI: Finger captured
                         self.root.after(0, self._update_registration_status, f"✅ Finger {i+1}/3 captured successfully! Please lift your finger.")
                         break
-            
+            if self.registration_cancelled:
+                zkfp2.Terminate()
+                self.root.after(0, self._fingerprint_registration_cancelled)
+                return
             # Update GUI: Processing template
             self.root.after(0, self._update_registration_status, "🔄 Processing fingerprint template...")
             
@@ -565,14 +604,23 @@ Settings are automatically saved to your local machine.
         """Update registration status in GUI"""
         self.register_status_label.configure(text=message, style='Info.TLabel')
             
+    def _fingerprint_registration_cancelled(self):
+        """Handle user cancellation of fingerprint registration"""
+        self.cancel_register_btn.pack_forget()
+        self.register_fp_btn.configure(state='normal')
+        self.register_status_label.configure(text="Registration cancelled.", style='Info.TLabel')
+        messagebox.showinfo("Cancelled", "Fingerprint registration was cancelled.")
+
     def _fingerprint_registration_success(self):
         """Handle successful fingerprint registration"""
+        self.cancel_register_btn.pack_forget()
         self.register_status_label.configure(text="Fingerprint registered successfully!", style='Success.TLabel')
         self.register_fp_btn.configure(state='normal')
         messagebox.showinfo("Success", "Fingerprint has been registered successfully!")
-        
+
     def _fingerprint_registration_error(self, error_message):
         """Handle fingerprint registration error"""
+        self.cancel_register_btn.pack_forget()
         self.register_status_label.configure(text=f"Registration failed: {error_message}", style='Error.TLabel')
         self.register_fp_btn.configure(state='normal')
         messagebox.showerror("Error", f"Fingerprint registration failed: {error_message}")
@@ -890,93 +938,13 @@ Settings are automatically saved to your local machine.
         self.current_match_user_data = None
         
     def _display_match_user_details(self, user_data):
-        """Display user details in a beautiful format"""
-        # Clear previous details
+        """Display user details with left (details) and right (photo/emoji) layout"""
         for widget in self.match_details_frame.winfo_children():
             widget.destroy()
-            
-        # Show details frame with limited height
         self.match_details_frame.pack(fill='x', pady=(0, 20))
-        
-        # Create frame for canvas and scrollbar
-        scroll_frame = ttk.Frame(self.match_details_frame)
-        scroll_frame.pack(fill='both', expand=True, padx=10, pady=10)
-        
-        # Create canvas and scrollbar for scrolling
-        canvas = tk.Canvas(scroll_frame, height=250, bg='#f8f9fa')
-        scrollbar = ttk.Scrollbar(scroll_frame, orient='vertical', command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        # Enable mouse wheel scrolling
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
-        
-        # Pack canvas and scrollbar
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        
-        # Create details container inside scrollable frame
-        details_container = scrollable_frame
-        
-        # Personal Information
-        personal_frame = ttk.LabelFrame(details_container, text="Personal Information", padding=10)
-        personal_frame.pack(fill='x', pady=(0, 10))
-        
-        self._add_detail_row(personal_frame, "Full Name:", user_data.get('full_name', 'N/A'))
-        self._add_detail_row(personal_frame, "Passport Number:", user_data.get('passport_number', 'N/A'))
-        self._add_detail_row(personal_frame, "Phone:", user_data.get('phone', 'N/A'))
-        self._add_detail_row(personal_frame, "Father's Name:", user_data.get('father_name', 'N/A'))
-        self._add_detail_row(personal_frame, "Birth Date:", self._format_date(user_data.get('birth_date')))
-        self._add_detail_row(personal_frame, "Gender:", user_data.get('gender', 'N/A'))
-        self._add_detail_row(personal_frame, "Nationality:", user_data.get('nationality', 'N/A'))
-        self._add_detail_row(personal_frame, "Profession:", user_data.get('profession', 'N/A'))
-        self._add_detail_row(personal_frame, "Religion:", user_data.get('religion', 'N/A'))
-        self._add_detail_row(personal_frame, "Address:", user_data.get('address', 'N/A'))
-        
-        # Fingerprint Status Section (show first for importance)
-        fingerprint_info = user_data.get('fingerprint', {})
-        fp_status_frame = ttk.LabelFrame(details_container, text="Fingerprint Status", padding=10)
-        fp_status_frame.pack(fill='x', pady=(0, 10))
-        
-        is_registered = fingerprint_info.get('registered', False)
-        has_template = fingerprint_info.get('has_template', False)
-        
-        status_text = "✅ Registered" if is_registered else "❌ Not Registered"
-        template_text = "✅ Template Available" if has_template else "❌ No Template"
-        
-        self._add_detail_row(fp_status_frame, "Registration Status:", status_text)
-        self._add_detail_row(fp_status_frame, "Template Status:", template_text)
-        
-        # Service Information
-        service_frame = ttk.LabelFrame(details_container, text="Service Information", padding=10)
-        service_frame.pack(fill='x', pady=(0, 10))
-        
-        self._add_detail_row(service_frame, "Amount:", f"৳{user_data.get('amount', 0)}")
-        self._add_detail_row(service_frame, "Delivery Date:", self._format_date(user_data.get('delivery_date')))
-        
-        # Branch and Country Information
-        if user_data.get('branch') or user_data.get('country'):
-            location_frame = ttk.LabelFrame(details_container, text="Location Information", padding=10)
-            location_frame.pack(fill='x', pady=(0, 10))
-            
-            if user_data.get('branch'):
-                branch = user_data['branch']
-                self._add_detail_row(location_frame, "Branch Name:", branch.get('name', 'N/A'))
-                self._add_detail_row(location_frame, "Branch Address:", branch.get('address', 'N/A'))
-                
-            if user_data.get('country'):
-                country = user_data['country']
-                self._add_detail_row(location_frame, "Country:", country.get('name', 'N/A'))
-        
+        details_container, _ = self._build_details_with_photo(self.match_details_frame, user_data, is_match_tab=True)
+        self._fill_detail_sections(details_container, user_data)
+
 def main():
     root = tk.Tk()
     app = FingerprintApp(root)
