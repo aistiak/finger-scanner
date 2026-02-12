@@ -425,7 +425,7 @@ Settings are automatically saved to your local machine.
                 raw = base64.b64decode(photo_source)
                 img = Image.open(io.BytesIO(raw))
             img = img.convert('RGB')
-            img.thumbnail((140, 180), Image.Resampling.LANCZOS)
+            img.thumbnail((280, 360), Image.Resampling.LANCZOS)
             return ImageTk.PhotoImage(img), None
         except Exception:
             return None, emoji
@@ -435,25 +435,27 @@ Settings are automatically saved to your local machine.
         Build two-column layout: left = scrollable details, right = photo or emoji.
         Returns (details_container for adding rows, right_frame, photo_ref to keep).
         """
-        # Outer horizontal split: left = details (shrink to content), right = photo (no gap)
+        # Outer horizontal split: left = details, right = photo (expands to fill empty space)
         content = ttk.Frame(parent_frame)
         content.pack(fill='both', expand=True, padx=5, pady=5)
         left_panel = ttk.Frame(content)
         left_panel.pack(side='left', fill='y', expand=False)
         right_panel = ttk.Frame(content)
-        right_panel.pack(side='left', padx=(10, 0), pady=10)
-        # Right side: fixed size placeholder for photo/emoji
+        right_panel.pack(side='left', fill='both', expand=True, padx=(10, 0), pady=10)
+        # Right side: photo/emoji fills available space
         photo_frame = ttk.LabelFrame(right_panel, text="Photo", padding=8)
-        photo_frame.pack()
+        photo_frame.pack(fill='both', expand=True)
+        photo_inner = ttk.Frame(photo_frame)
+        photo_inner.pack(fill='both', expand=True)
         photo_ref = [None]  # keep ref so PhotoImage is not garbage-collected
         photo_image, emoji = self._get_user_photo_or_emoji(user_data)
         if photo_image:
             photo_ref[0] = photo_image
-            lbl = ttk.Label(photo_frame, image=photo_image)
-            lbl.pack()
+            lbl = ttk.Label(photo_inner, image=photo_image)
+            lbl.pack(expand=True)
         else:
-            lbl = tk.Label(photo_frame, text=emoji, font=('Segoe UI Emoji', 72), bg='#f8f9fa', fg='#495057')
-            lbl.pack(padx=10, pady=10)
+            lbl = tk.Label(photo_inner, text=emoji, font=('Segoe UI Emoji', 120), bg='#f8f9fa', fg='#495057')
+            lbl.pack(expand=True, padx=20, pady=20)
         # Left: scrollable details (no horizontal expand so no grey gap)
         scroll_frame = ttk.Frame(left_panel)
         scroll_frame.pack(fill='y', expand=False)
