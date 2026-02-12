@@ -6,6 +6,8 @@ import base64
 import io
 from datetime import datetime
 import threading
+import time
+import multiprocessing
 import sys
 import os
 
@@ -18,6 +20,41 @@ except ImportError:
 # Add parent directory to path to import fingerprint modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from py3 import store_finger, match_fingerprint, list_fingers, init_db
+
+
+def _registration_worker_process(progress_queue, result_queue):
+    """
+    Run in a separate process so device handles are fully released when process exits.
+    progress_queue: put progress messages (str). result_queue: put ('ok', template_b64) or ('error', message).
+    """
+    try:
+        from pyzkfp import ZKFP2
+        import base64
+        progress_queue.put("🔧 Initializing fingerprint device...")
+        zkfp2 = ZKFP2()
+        zkfp2.Init()
+        progress_queue.put("⚙️ Opening device...")
+        zkfp2.OpenDevice(0)
+        progress_queue.put("✅ Device connected successfully")
+        templates = []
+        for i in range(3):
+            progress_queue.put(f"👆 Place finger {i+1}/3 - Waiting for finger on scanner...")
+            while True:
+                capture = zkfp2.AcquireFingerprint()
+                if capture:
+                    templates.append(capture[0])
+                    progress_queue.put(f"✅ Finger {i+1}/3 captured successfully! Please lift your finger.")
+                    break
+        progress_queue.put("🔄 Processing fingerprint template...")
+        reg_temp, _ = zkfp2.DBMerge(*templates)
+        template_b64 = base64.b64encode(bytes(reg_temp)).decode('utf-8')
+        try:
+            zkfp2.Terminate()
+        except Exception:
+            pass
+        result_queue.put(('ok', template_b64))
+    except Exception as e:
+        result_queue.put(('error', str(e)))
 
 
 class FingerprintApp:
@@ -99,6 +136,7 @@ class FingerprintApp:
         self.register_status_label = ttk.Label(top_frame, text="", style='Info.TLabel')
         self.register_status_label.pack(anchor='w', pady=(2, 0))
         self.registration_cancelled = False
+        self._registration_just_cancelled = False
         self.current_user_data = None
         
         # User details section (gets most of the space)
@@ -477,93 +515,86 @@ Settings are automatically saved to your local machine.
         thread.start()
 
     def _cancel_registration(self):
-        """Set flag so registration thread can exit; UI is updated by the thread or on next check."""
+        """Terminate the registration process so OS releases device handles; no invalid handle on retry."""
         self.registration_cancelled = True
         self.register_status_label.configure(text="Cancelling...", style='Info.TLabel')
-        
+        if getattr(self, '_registration_process', None) is not None:
+            try:
+                self._registration_process.terminate()
+                self._registration_process.join(timeout=2.0)
+                if self._registration_process.is_alive():
+                    self._registration_process.kill()
+            except Exception:
+                pass
+            self._registration_process = None
+        self.root.after(0, self._finish_registration_cancelled)
+
+    def _finish_registration_cancelled(self):
+        """Called after cancel to reset UI (from main or polling thread)."""
+        self.cancel_register_btn.pack_forget()
+        self.register_fp_btn.configure(state='normal')
+        self.register_status_label.configure(text="Registration cancelled.", style='Info.TLabel')
+        messagebox.showinfo("Cancelled", "Fingerprint registration was cancelled.")
+
     def _register_fingerprint_thread(self):
-        """Register fingerprint in separate thread"""
+        """Run registration in a separate process so killing it releases all device handles."""
+        self._registration_process = None
         try:
-            # Capture fingerprint using local scanner
-            from pyzkfp import ZKFP2
-            import base64
-            
-            # Update GUI: Initializing device
-            self.root.after(0, self._update_registration_status, "🔧 Initializing fingerprint device...")
-            
-            zkfp2 = ZKFP2()
-            zkfp2.Init()
-            
-            # Update GUI: Setting exposure parameters
-            self.root.after(0, self._update_registration_status, "⚙️ Setting exposure parameters...")
-            
-            zkfp2.OpenDevice(0)
-            
-            # Update GUI: Device ready
-            self.root.after(0, self._update_registration_status, "✅ Device connected successfully")
-            if self.registration_cancelled:
-                zkfp2.Terminate()
-                self.root.after(0, self._fingerprint_registration_cancelled)
-                return
-            templates = []
-            for i in range(3):
+            progress_queue = multiprocessing.Queue()
+            result_queue = multiprocessing.Queue()
+            p = multiprocessing.Process(target=_registration_worker_process, args=(progress_queue, result_queue))
+            self._registration_process = p
+            p.start()
+            result_received = None
+            while True:
                 if self.registration_cancelled:
-                    zkfp2.Terminate()
-                    self.root.after(0, self._fingerprint_registration_cancelled)
-                    return
-                self.root.after(0, self._update_registration_status, f"👆 Place finger {i+1}/3 - Waiting for finger on scanner... (Cancel to abort)")
-                while True:
-                    if self.registration_cancelled:
-                        zkfp2.Terminate()
-                        self.root.after(0, self._fingerprint_registration_cancelled)
-                        return
-                    capture = zkfp2.AcquireFingerprint()
-                    if capture:
-                        templates.append(capture[0])
-                        self.root.after(0, self._update_registration_status, f"✅ Finger {i+1}/3 captured successfully! Please lift your finger.")
-                        break
-            if self.registration_cancelled:
-                zkfp2.Terminate()
-                self.root.after(0, self._fingerprint_registration_cancelled)
+                    break
+                try:
+                    msg = progress_queue.get(timeout=0.3)
+                    self.root.after(0, self._update_registration_status, msg)
+                except multiprocessing.queues.Empty:
+                    pass
+                try:
+                    result_received = result_queue.get_nowait()
+                    break
+                except multiprocessing.queues.Empty:
+                    pass
+                if not p.is_alive():
+                    if result_received is None:
+                        result_received = ('error', 'Process ended unexpectedly (cancelled or crashed).')
+                    break
+                time.sleep(0.05)
+            if self._registration_process is not None:
+                try:
+                    p.join(timeout=1.0)
+                except Exception:
+                    pass
+                self._registration_process = None
+            if result_received is None:
+                if self.registration_cancelled:
+                    pass  # _finish_registration_cancelled already called from _cancel_registration
+                else:
+                    self.root.after(0, self._fingerprint_registration_error, "Registration process ended unexpectedly.")
                 return
-            # Update GUI: Processing template
-            self.root.after(0, self._update_registration_status, "🔄 Processing fingerprint template...")
-            
-            # Use first template (avoiding DBMerge issues)
-            # reg_temp = templates[0]
-            reg_temp, _ = zkfp2.DBMerge(*templates)
-            
-            # Convert template to base64 for API
-            template_b64 = base64.b64encode(bytes(reg_temp)).decode('utf-8')
-            
-            zkfp2.Terminate()
-            
-            # Update GUI: Sending to server
+            status, value = result_received
+            if status == 'error':
+                self.root.after(0, self._fingerprint_registration_error, value)
+                return
+            template_b64 = value
             self.root.after(0, self._update_registration_status, "📡 Sending fingerprint data to server...")
-            
-            # Send to API
             passport_number = self.current_user_data.get('passport_number')
-            api_data = {
-                "passport_number": passport_number,
-                "template": template_b64
-            }
-            
+            api_data = {"passport_number": passport_number, "template": template_b64}
             response = requests.post(
                 self.fingerprint_api_url,
                 json=api_data,
                 headers={"Content-Type": "application/json"},
                 timeout=10
             )
-            
-            # Print response for debugging
             print(f"API Response Status: {response.status_code}")
             print(f"API Response Text: {response.text}")
-            
-            if response.status_code in [200, 201]:  # Accept both 200 and 201
+            if response.status_code in [200, 201]:
                 try:
                     result = response.json()
-                    print(f"API Response JSON: {result}")
-                    
                     if result.get('success', False):
                         self.root.after(0, self._fingerprint_registration_success)
                     else:
@@ -572,21 +603,15 @@ Settings are automatically saved to your local machine.
                     self.root.after(0, self._fingerprint_registration_error, "Invalid JSON response from API")
             else:
                 self.root.after(0, self._fingerprint_registration_error, f"API Error: {response.status_code} - {response.text}")
-                
         except Exception as e:
             self.root.after(0, self._fingerprint_registration_error, str(e))
+        finally:
+            self._registration_process = None
     
     def _update_registration_status(self, message):
         """Update registration status in GUI"""
         self.register_status_label.configure(text=message, style='Info.TLabel')
             
-    def _fingerprint_registration_cancelled(self):
-        """Handle user cancellation of fingerprint registration"""
-        self.cancel_register_btn.pack_forget()
-        self.register_fp_btn.configure(state='normal')
-        self.register_status_label.configure(text="Registration cancelled.", style='Info.TLabel')
-        messagebox.showinfo("Cancelled", "Fingerprint registration was cancelled.")
-
     def _fingerprint_registration_success(self):
         """Handle successful fingerprint registration"""
         self.cancel_register_btn.pack_forget()
