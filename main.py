@@ -206,12 +206,17 @@ class FingerprintApp:
         self.match_search_btn = ttk.Button(row1, text="Search", command=self.match_search_passport)
         self.match_search_btn.pack(side='left', padx=(0, 15))
         self.match_btn = ttk.Button(row1, text="Match Fingerprint", command=self.match_fingerprint)
-        self.match_btn.pack(side='left')
+        self.match_btn.pack(side='left', padx=(0, 8))
+        self.cancel_match_btn = ttk.Button(row1, text="Cancel", command=self._cancel_match)
+        self.cancel_match_btn.pack(side='left')
+        self.cancel_match_btn.pack_forget()
         self.match_loading_label = ttk.Label(top_frame, text="", style='Info.TLabel')
         self.match_loading_label.pack(anchor='w', pady=(6, 0))
         self.match_result_label = ttk.Label(top_frame, text="", style='Info.TLabel')
         self.match_result_label.pack(anchor='w', pady=(2, 0))
         self.current_match_user_data = None
+        self.match_cancelled = False
+        self._match_process = None
         
         # User details section (gets most of the space, same as Register)
         self.match_details_frame = ttk.LabelFrame(main_container, text="User Details", padding=15)
@@ -670,7 +675,9 @@ Settings are automatically saved to your local machine.
             messagebox.showerror("Error", "Please search for a passport first")
             return
             
+        self.match_cancelled = False
         self.match_btn.configure(state='disabled')
+        self.cancel_match_btn.pack(side='left')
         self.match_result_label.configure(text="Matching fingerprint... Please place finger on scanner.", 
                                         style='Info.TLabel')
         
@@ -721,9 +728,12 @@ Settings are automatically saved to your local machine.
             progress_queue = multiprocessing.Queue()
             result_queue = multiprocessing.Queue()
             p = multiprocessing.Process(target=_match_worker_process, args=(progress_queue, result_queue, stored_template_b64))
+            self._match_process = p
             p.start()
             result_received = None
             while True:
+                if self.match_cancelled:
+                    break
                 try:
                     msg = progress_queue.get(timeout=0.3)
                     self.root.after(0, self._update_match_status, msg)
@@ -739,9 +749,17 @@ Settings are automatically saved to your local machine.
                         result_received = ('error', 'Match process ended unexpectedly.')
                     break
                 time.sleep(0.05)
-            p.join(timeout=1.0)
+            if self._match_process is not None:
+                try:
+                    p.join(timeout=1.0)
+                except Exception:
+                    pass
+                self._match_process = None
             if result_received is None:
-                self.root.after(0, self._handle_match_error, "Match process ended without result.")
+                if self.match_cancelled:
+                    pass  # _finish_match_cancelled already called from _cancel_match
+                else:
+                    self.root.after(0, self._handle_match_error, "Match process ended without result.")
                 return
             status, value = result_received
             if status == 'error':
@@ -752,12 +770,35 @@ Settings are automatically saved to your local machine.
         except Exception as e:
             self.root.after(0, self._handle_match_error, str(e))
 
+    def _cancel_match(self):
+        """Terminate the match process and reset UI."""
+        self.match_cancelled = True
+        self.match_result_label.configure(text="Cancelling...", style='Info.TLabel')
+        if getattr(self, '_match_process', None) is not None:
+            try:
+                self._match_process.terminate()
+                self._match_process.join(timeout=2.0)
+                if self._match_process.is_alive():
+                    self._match_process.kill()
+            except Exception:
+                pass
+            self._match_process = None
+        self.root.after(0, self._finish_match_cancelled)
+
+    def _finish_match_cancelled(self):
+        """Reset Match tab UI after cancel."""
+        self.cancel_match_btn.pack_forget()
+        self.match_btn.configure(state='normal')
+        self.match_result_label.configure(text="Match cancelled.", style='Info.TLabel')
+        messagebox.showinfo("Cancelled", "Fingerprint match was cancelled.")
+
     def _update_match_status(self, message):
         """Update match status in GUI"""
         self.match_result_label.configure(text=message, style='Info.TLabel')
             
     def _handle_match_result(self, result):
         """Handle fingerprint match result"""
+        self.cancel_match_btn.pack_forget()
         self.match_btn.configure(state='normal')
         if result:
             self.match_result_label.configure(text="✅ Match successful", 
@@ -770,6 +811,7 @@ Settings are automatically saved to your local machine.
             
     def _handle_match_error(self, error_message):
         """Handle fingerprint match error"""
+        self.cancel_match_btn.pack_forget()
         self.match_btn.configure(state='normal')
         self.match_result_label.configure(text=f"Error: {error_message}", style='Error.TLabel')
         messagebox.showerror("Error", f"Matching failed: {error_message}")
