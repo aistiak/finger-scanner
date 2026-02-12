@@ -23,7 +23,7 @@ from py3 import store_finger, match_fingerprint, list_fingers, init_db
 class FingerprintApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Fingerprint Registration System")
+        self.root.title("RTMS Biometric system")
         self.root.geometry("900x700")
         self.root.configure(bg='#f0f0f0')
         
@@ -62,6 +62,8 @@ class FingerprintApp:
         style.configure('Info.TLabel', font=('Arial', 10), background='#f0f0f0')
         style.configure('Success.TLabel', font=('Arial', 10), foreground='#28a745', background='#f0f0f0')
         style.configure('Error.TLabel', font=('Arial', 10), foreground='#dc3545', background='#f0f0f0')
+        style.configure('MatchSuccess.TLabel', font=('Arial', 16, 'bold'), foreground='#28a745', background='#f0f0f0')
+        style.configure('MatchNoMatch.TLabel', font=('Arial', 16, 'bold'), foreground='#dc3545', background='#f0f0f0')
         
     def create_register_tab(self):
         """Create the registration tab"""
@@ -115,58 +117,30 @@ class FingerprintApp:
         
         # Title
         title_label = ttk.Label(main_container, text="Fingerprint Matching", style='Title.TLabel')
-        title_label.pack(pady=(0, 20))
+        title_label.pack(pady=(0, 10))
         
-        # Passport search section
-        search_frame = ttk.LabelFrame(main_container, text="Passport Search", padding=15)
-        search_frame.pack(fill='x', pady=(0, 20))
-        
-        # Passport number input
-        passport_label = ttk.Label(search_frame, text="Passport Number:", style='Heading.TLabel')
-        passport_label.pack(anchor='w', pady=(0, 5))
-        
-        passport_input_frame = ttk.Frame(search_frame)
-        passport_input_frame.pack(fill='x', pady=(0, 10))
-        
-        self.match_passport_entry = ttk.Entry(passport_input_frame, font=('Arial', 12), width=20)
-        self.match_passport_entry.pack(side='left', padx=(0, 10))
-        
-        self.match_search_btn = ttk.Button(passport_input_frame, text="Search", command=self.match_search_passport)
-        self.match_search_btn.pack(side='left')
-        
-        # Loading indicator
-        self.match_loading_label = ttk.Label(search_frame, text="", style='Info.TLabel')
-        self.match_loading_label.pack(anchor='w', pady=(5, 0))
-        
-        # User details section
-        self.match_details_frame = ttk.LabelFrame(main_container, text="User Details", padding=15)
-        self.match_details_frame.pack(fill='both', expand=True, pady=(0, 20))
-        
-        # Initially hide details frame
-        self.match_details_frame.pack_forget()
-        
-        # Fingerprint matching section
-        match_section = ttk.LabelFrame(main_container, text="Fingerprint Matching", padding=15)
-        match_section.pack(fill='x')
-        
-        # Finger ID input
-        id_frame = ttk.Frame(match_section)
-        id_frame.pack(fill='x', pady=(0, 10))
-        
-        ttk.Label(id_frame, text="Finger ID:", style='Heading.TLabel').pack(side='left', padx=(0, 10))
-        self.finger_id_entry = ttk.Entry(id_frame, font=('Arial', 12), width=15)
-        self.finger_id_entry.pack(side='left')
-        
-        # Match button
-        self.match_btn = ttk.Button(match_section, text="Match Fingerprint", command=self.match_fingerprint)
-        self.match_btn.pack(pady=10)
-        
-        # Match result
-        self.match_result_label = ttk.Label(match_section, text="", style='Info.TLabel')
-        self.match_result_label.pack(pady=(5, 0))
-        
-        # Store match user data
+        # Compact top bar: Search + Match side by side (same as Register tab)
+        top_frame = ttk.LabelFrame(main_container, text="Search & Match", padding=10)
+        top_frame.pack(fill='x', pady=(0, 10))
+        row1 = ttk.Frame(top_frame)
+        row1.pack(fill='x')
+        ttk.Label(row1, text="Passport Number:", style='Heading.TLabel').pack(side='left', padx=(0, 5))
+        self.match_passport_entry = ttk.Entry(row1, font=('Arial', 12), width=18)
+        self.match_passport_entry.pack(side='left', padx=(0, 8))
+        self.match_search_btn = ttk.Button(row1, text="Search", command=self.match_search_passport)
+        self.match_search_btn.pack(side='left', padx=(0, 15))
+        self.match_btn = ttk.Button(row1, text="Match Fingerprint", command=self.match_fingerprint)
+        self.match_btn.pack(side='left')
+        self.match_loading_label = ttk.Label(top_frame, text="", style='Info.TLabel')
+        self.match_loading_label.pack(anchor='w', pady=(6, 0))
+        self.match_result_label = ttk.Label(top_frame, text="", style='Info.TLabel')
+        self.match_result_label.pack(anchor='w', pady=(2, 0))
         self.current_match_user_data = None
+        
+        # User details section (gets most of the space, same as Register)
+        self.match_details_frame = ttk.LabelFrame(main_container, text="User Details", padding=15)
+        self.match_details_frame.pack(fill='both', expand=True, pady=(0, 0))
+        self.match_details_frame.pack_forget()
         
     def create_settings_tab(self):
         """Create the settings tab"""
@@ -742,11 +716,11 @@ Settings are automatically saved to your local machine.
         self.match_btn.configure(state='normal')
         if result:
             self.match_result_label.configure(text="✅ Match successful", 
-                                            style='Success.TLabel')
+                                            style='MatchSuccess.TLabel')
             messagebox.showinfo("Match Success", "Fingerprint matched successfully")
         else:
-            self.match_result_label.configure(text="❌ No match found", 
-                                            style='Error.TLabel')
+            self.match_result_label.configure(text="❌ Does not match", 
+                                            style='MatchNoMatch.TLabel')
             messagebox.showwarning("No Match", "Fingerprint does not match")
             
     def _handle_match_error(self, error_message):
