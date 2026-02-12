@@ -57,6 +57,44 @@ def _registration_worker_process(progress_queue, result_queue):
         result_queue.put(('error', str(e)))
 
 
+def _match_worker_process(progress_queue, result_queue, stored_template_b64):
+    """
+    Run in a separate process so device handles are fully released when process exits.
+    progress_queue: progress messages (str). result_queue: ('ok', True/False) or ('error', message).
+    stored_template_b64: base64 string of the stored template to match against.
+    """
+    try:
+        from pyzkfp import ZKFP2
+        import base64
+        stored_template = base64.b64decode(stored_template_b64)
+        progress_queue.put("🔧 Initializing fingerprint device...")
+        zkfp2 = ZKFP2()
+        zkfp2.Init()
+        progress_queue.put("⚙️ Opening device...")
+        zkfp2.OpenDevice(0)
+        progress_queue.put("✅ Device connected successfully")
+        templates = []
+        for i in range(3):
+            progress_queue.put(f"👆 Place finger {i+1}/3 - Waiting for finger on scanner...")
+            while True:
+                capture = zkfp2.AcquireFingerprint()
+                if capture:
+                    templates.append(capture[0])
+                    progress_queue.put(f"✅ Finger {i+1}/3 captured successfully! Please lift your finger.")
+                    break
+        progress_queue.put("🔄 Processing captured fingerprint...")
+        live_template, _ = zkfp2.DBMerge(*templates)
+        progress_queue.put("🔍 Comparing fingerprints...")
+        match_result = zkfp2.DBMatch(stored_template, live_template)
+        try:
+            zkfp2.Terminate()
+        except Exception:
+            pass
+        result_queue.put(('ok', match_result > 0))
+    except Exception as e:
+        result_queue.put(('error', str(e)))
+
+
 class FingerprintApp:
     def __init__(self, root):
         self.root = root
@@ -679,59 +717,41 @@ Settings are automatically saved to your local machine.
                 self.root.after(0, self._handle_match_error, "No template found in API response")
                 return
             
-            # Decode stored template
-            stored_template = base64.b64decode(stored_template_b64)
-            
-            # Capture live fingerprint using local scanner
-            from pyzkfp import ZKFP2
-            
-            # Initialize device only if not already initialized
-            if not hasattr(self, 'zkfp2') or self.zkfp2 is None:
-                # Update GUI: Initializing device
-                self.root.after(0, self._update_match_status, "🔧 Initializing fingerprint device...")
-                
-                self.zkfp2 = ZKFP2()
-                self.zkfp2.Init()
-                self.zkfp2.OpenDevice(0)
-                
-                # Update GUI: Device ready
-                self.root.after(0, self._update_match_status, "✅ Device connected successfully")
-            else:
-                # Update GUI: Device already ready
-                self.root.after(0, self._update_match_status, "✅ Using existing device connection")
-            
-            # Capture 3 samples for better accuracy
-            templates = []
-            for i in range(3):
-                # Update GUI: Waiting for finger placement
-                self.root.after(0, self._update_match_status, f"👆 Place finger {i+1}/3 - Waiting for finger on scanner...")
-                
-                while True:
-                    capture = self.zkfp2.AcquireFingerprint()
-                    if capture:
-                        templates.append(capture[0])
-                        # Update GUI: Finger captured
-                        self.root.after(0, self._update_match_status, f"✅ Finger {i+1}/3 captured successfully! Please lift your finger.")
-                        break
-            
-            # Update GUI: Processing template
-            self.root.after(0, self._update_match_status, "🔄 Processing captured fingerprint...")
-            
-            # Merge captured templates
-            live_template, _ = self.zkfp2.DBMerge(*templates)
-            
-            # Update GUI: Matching
-            self.root.after(0, self._update_match_status, "🔍 Comparing fingerprints...")
-            
-            # Perform matching using ZKFP2
-            match_result = self.zkfp2.DBMatch(stored_template, live_template)
-            
-            # Handle result
-            self.root.after(0, self._handle_match_result, match_result > 0)
+            # Run device capture and match in a separate process so handle is released when done
+            progress_queue = multiprocessing.Queue()
+            result_queue = multiprocessing.Queue()
+            p = multiprocessing.Process(target=_match_worker_process, args=(progress_queue, result_queue, stored_template_b64))
+            p.start()
+            result_received = None
+            while True:
+                try:
+                    msg = progress_queue.get(timeout=0.3)
+                    self.root.after(0, self._update_match_status, msg)
+                except multiprocessing.queues.Empty:
+                    pass
+                try:
+                    result_received = result_queue.get_nowait()
+                    break
+                except multiprocessing.queues.Empty:
+                    pass
+                if not p.is_alive():
+                    if result_received is None:
+                        result_received = ('error', 'Match process ended unexpectedly.')
+                    break
+                time.sleep(0.05)
+            p.join(timeout=1.0)
+            if result_received is None:
+                self.root.after(0, self._handle_match_error, "Match process ended without result.")
+                return
+            status, value = result_received
+            if status == 'error':
+                self.root.after(0, self._handle_match_error, value)
+                return
+            self.root.after(0, self._handle_match_result, value)
             
         except Exception as e:
             self.root.after(0, self._handle_match_error, str(e))
-            
+
     def _update_match_status(self, message):
         """Update match status in GUI"""
         self.match_result_label.configure(text=message, style='Info.TLabel')
