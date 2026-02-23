@@ -26,7 +26,7 @@ a = Analysis(
     datas=[
         ('app_settings.json', '.'),
         ('fingerprints-1.db', '.'),
-        ('../py3.py', '.'),
+        ('py3.py', '.'),
     ],
     hiddenimports=[
         'tkinter',
@@ -43,6 +43,13 @@ a = Analysis(
         'sys',
         'ctypes',
         'ctypes.wintypes',
+        # pkg_resources / setuptools runtime hook dependencies
+        'jaraco',
+        'jaraco.text',
+        'jaraco.functools',
+        'jaraco.context',
+        'jaraco.classes',
+        'more_itertools',
     ],
     hookspath=[],
     hooksconfig={},
@@ -63,8 +70,9 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='FingerprintRegistrationSystem',
+    name='FingerprintApp',
     debug=False,
+    icon='icon.ico',
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
