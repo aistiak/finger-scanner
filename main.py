@@ -577,66 +577,134 @@ Settings are automatically saved to your local machine.
         except:
             return date_str
 
-    def _get_user_photo_or_emoji(self, user_data):
-        """
-        Get user photo from data.user (or data) as URL or base64.
-        Returns (photo_image_for_tk, emoji_fallback).
-        If photo is available: (PhotoImage, None). If not: (None, '👨' or '👩').
-        """
+    def _find_photo_in_dict(self, obj, depth=0, max_depth=4):
+        """Recursively find first non-empty string value for photo-like keys in dict/lists."""
+        if depth > max_depth or obj is None:
+            return None
+        photo_keys = (
+            'photo', 'image', 'image_url', 'avatar', 'photo_url', 'user_photo',
+            'patient_photo', 'photo_path', 'profile_photo', 'passport_photo',
+            'applicant_photo', 'picture', 'photo_path_url'
+        )
+        if isinstance(obj, dict):
+            for key in photo_keys:
+                val = obj.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+            for v in obj.values():
+                found = self._find_photo_in_dict(v, depth + 1, max_depth)
+                if found:
+                    return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = self._find_photo_in_dict(item, depth + 1, max_depth)
+                if found:
+                    return found
+        return None
+
+    def _get_photo_source_and_emoji(self, user_data):
+        """Get photo URL or base64 string from API response, and emoji. Returns (source_string or None, emoji)."""
         gender = (user_data.get('gender') or '').lower()
         emoji = '👩' if gender == 'female' else '👨'
-        photo_source = None
-        user_obj = user_data.get('user') or {}
-        for key in ('photo', 'image', 'image_url', 'avatar'):
-            if user_obj.get(key):
-                photo_source = user_obj.get(key)
-                break
+        photo_source = self._find_photo_in_dict(user_data)
         if not photo_source:
-            photo_source = user_data.get('photo') or user_data.get('image') or user_data.get('image_url')
-        if not photo_source or not HAS_PIL:
             return None, emoji
+        # Resolve relative paths (e.g. /storage/photos/patient_xxx.jpeg)
+        if isinstance(photo_source, str) and photo_source.startswith('/') and not photo_source.startswith('//'):
+            base = (self.settings.get('server_url') or 'http://rtmsbd.com').rstrip('/')
+            photo_source = base + photo_source
+        return photo_source, emoji
+
+    def _fetch_image_bytes(self, photo_source):
+        """Fetch image bytes from URL or decode base64. Returns bytes or None. Runs in thread."""
         try:
             if isinstance(photo_source, str) and photo_source.startswith(('http://', 'https://')):
-                r = requests.get(photo_source, timeout=5)
+                headers = {'User-Agent': 'RTMS-Biometric-App/1.0'}
+                r = requests.get(photo_source, timeout=20, headers=headers, verify=True)
                 r.raise_for_status()
-                img = Image.open(io.BytesIO(r.content))
-            else:
-                # Assume base64
-                raw = base64.b64decode(photo_source)
-                img = Image.open(io.BytesIO(raw))
-            img = img.convert('RGB')
-            img.thumbnail((280, 360), Image.Resampling.LANCZOS)
-            return ImageTk.PhotoImage(img), None
-        except Exception:
-            return None, emoji
+                return r.content
+            elif isinstance(photo_source, str):
+                return base64.b64decode(photo_source)
+        except requests.exceptions.SSLError:
+            try:
+                r = requests.get(photo_source, timeout=20, headers={'User-Agent': 'RTMS-Biometric-App/1.0'}, verify=False)
+                r.raise_for_status()
+                return r.content
+            except Exception:
+                return None
+        except Exception as e:
+            print(f"[Photo] Load failed: {e}")
+            return None
+        return None
+
+    def _apply_photo_to_frame(self, photo_inner, image_bytes, emoji, is_match_tab):
+        """Create PhotoImage from bytes and show in photo_inner (main thread). Keep ref on self."""
+        try:
+            if not photo_inner.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        for w in photo_inner.winfo_children():
+            w.destroy()
+        ref_attr = '_match_photo_ref' if is_match_tab else '_register_photo_ref'
+        setattr(self, ref_attr, [None])
+        if image_bytes and HAS_PIL:
+            try:
+                img = Image.open(io.BytesIO(image_bytes))
+                img = img.convert('RGB')
+                img.thumbnail((280, 360), Image.Resampling.LANCZOS)
+                photo_image = ImageTk.PhotoImage(img)
+                getattr(self, ref_attr)[0] = photo_image
+                lbl = ttk.Label(photo_inner, image=photo_image)
+                lbl.pack(expand=True)
+                return
+            except Exception as e:
+                print(f"[Photo] Decode failed: {e}")
+        lbl = tk.Label(photo_inner, text=emoji, font=('Segoe UI Emoji', 120), bg='#f8f9fa', fg='#495057')
+        lbl.pack(expand=True, padx=20, pady=20)
 
     def _build_details_with_photo(self, parent_frame, user_data, is_match_tab=False):
         """
         Build two-column layout: left = scrollable details, right = photo or emoji.
-        Returns (details_container for adding rows, right_frame, photo_ref to keep).
+        Photo is loaded in a background thread so the UI stays responsive; ref is kept on self.
         """
-        # Outer horizontal split: left = details, right = photo (expands to fill empty space)
         content = ttk.Frame(parent_frame)
         content.pack(fill='both', expand=True, padx=5, pady=5)
         left_panel = ttk.Frame(content)
         left_panel.pack(side='left', fill='y', expand=False)
         right_panel = ttk.Frame(content)
         right_panel.pack(side='left', fill='both', expand=True, padx=(10, 0), pady=10)
-        # Right side: photo/emoji fills available space
         photo_frame = ttk.LabelFrame(right_panel, text="Photo", padding=8)
         photo_frame.pack(fill='both', expand=True)
         photo_inner = ttk.Frame(photo_frame)
         photo_inner.pack(fill='both', expand=True)
-        photo_ref = [None]  # keep ref so PhotoImage is not garbage-collected
-        photo_image, emoji = self._get_user_photo_or_emoji(user_data)
-        if photo_image:
-            photo_ref[0] = photo_image
-            lbl = ttk.Label(photo_inner, image=photo_image)
-            lbl.pack(expand=True)
-        else:
-            lbl = tk.Label(photo_inner, text=emoji, font=('Segoe UI Emoji', 120), bg='#f8f9fa', fg='#495057')
-            lbl.pack(expand=True, padx=20, pady=20)
-        # Left: scrollable details (no horizontal expand so no grey gap)
+        # Placeholder while loading (so panel is never blank)
+        gender = (user_data.get('gender') or '').lower()
+        emoji = '👩' if gender == 'female' else '👨'
+        loading_lbl = tk.Label(photo_inner, text="Loading…\n" + emoji, font=('Arial', 14), bg='#f8f9fa', fg='#495057')
+        loading_lbl.pack(expand=True, padx=20, pady=20)
+        photo_source, emoji = self._get_photo_source_and_emoji(user_data)
+        if not photo_source or not HAS_PIL:
+            loading_lbl.config(text=emoji, font=('Segoe UI Emoji', 120))
+            scroll_frame = ttk.Frame(left_panel)
+            scroll_frame.pack(fill='y', expand=False)
+            canvas = tk.Canvas(scroll_frame, height=360, bg='#f8f9fa')
+            scrollbar = ttk.Scrollbar(scroll_frame, orient='vertical', command=canvas.yview)
+            scrollable_frame = ttk.Frame(canvas)
+            scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+            canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+            canvas.configure(yscrollcommand=scrollbar.set)
+            def _on_mousewheel(event):
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            scrollbar.pack(side='left', fill='y')
+            canvas.pack(side='left', fill='y', expand=False)
+            return scrollable_frame, None
+        def load_then_apply():
+            data = self._fetch_image_bytes(photo_source)
+            self.root.after(0, self._apply_photo_to_frame, photo_inner, data, emoji, is_match_tab)
+        threading.Thread(target=load_then_apply, daemon=True).start()
+        # Scrollable details (left)
         scroll_frame = ttk.Frame(left_panel)
         scroll_frame.pack(fill='y', expand=False)
         canvas = tk.Canvas(scroll_frame, height=360, bg='#f8f9fa')
@@ -650,7 +718,7 @@ Settings are automatically saved to your local machine.
         canvas.bind_all("<MouseWheel>", _on_mousewheel)
         scrollbar.pack(side='left', fill='y')
         canvas.pack(side='left', fill='y', expand=False)
-        return scrollable_frame, photo_ref
+        return scrollable_frame, None
 
     def register_fingerprint(self):
         """Register fingerprint for the current user"""
