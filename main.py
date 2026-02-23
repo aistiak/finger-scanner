@@ -38,7 +38,7 @@ FULL_ACCESS_ROLES = (SUPER_ADMIN_ROLE,)  # super_admin and beman get full access
 def _load_settings_for_login():
     """Load settings from JSON (used before main app exists)."""
     settings_file = "app_settings.json"
-    default = {"server_url": "http://localhost:4111", "last_updated": datetime.now().isoformat()}
+    default = {"server_url": "https://rtmsbd.com", "last_updated": datetime.now().isoformat()}
     try:
         if os.path.exists(settings_file):
             with open(settings_file, 'r') as f:
@@ -117,7 +117,7 @@ class LoginScreen:
 
     def _login_thread(self, email, password):
         try:
-            server_url = self.settings.get('server_url', 'http://localhost:4111').rstrip('/')
+            server_url = self.settings.get('server_url', 'http://rtmsbd.com').rstrip('/')
             url = f"{server_url}/api/v1/login"
             body = {"email": email, "password": password}
             response = requests.post(url, json=body, headers={"Content-Type": "application/json"}, timeout=15)
@@ -171,6 +171,14 @@ def _can_register(user_info):
     return False
 
 
+def _can_match(user_info):
+    """True if user can match fingerprint. Frontdesk cannot match; everyone else can."""
+    if not user_info:
+        return False
+    role = (user_info.get('role') or '').strip().lower()
+    return role != FRONTDESK_ROLE
+
+
 class FingerprintApp:
     def __init__(self, root, auth_token=None, user_info=None, on_logout=None):
         self.root = root
@@ -181,6 +189,7 @@ class FingerprintApp:
         self.root.geometry("900x700")
         self.root.configure(bg='#f0f0f0')
         self.can_register = _can_register(user_info)
+        self.can_match = _can_match(user_info)
         
         # Initialize database
         init_db()
@@ -206,14 +215,15 @@ class FingerprintApp:
         # Load settings
         self.settings = self.load_settings()
         
-        # Create tabs: Register for super_admin, beman, frontdesk; Match and Settings for everyone
+        # Create tabs: Register for super_admin, beman, frontdesk; Match for non-frontdesk; Settings for everyone
         if self.can_register:
             self.create_register_tab()
-        self.create_match_tab()
+        if self.can_match:
+            self.create_match_tab()
         self.create_settings_tab()
         
         # API URLs from settings
-        server_url = self.settings.get('server_url', 'http://localhost:4111')
+        server_url = self.settings.get('server_url', 'http://rtmsbd.com')
         self.api_base_url = server_url + "/api/v1/service-request/passport/"
         self.fingerprint_api_url = server_url + "/api/v1/fingerprint/register"
         self.fingerprint_lookup_url = server_url + "/api/v1/finger/passport"
@@ -367,7 +377,7 @@ class FingerprintApp:
         self.server_url_entry.pack(fill='x', pady=(0, 10))
         
         # Load current setting
-        current_url = self.settings.get('server_url', 'http://localhost:4111')
+        current_url = self.settings.get('server_url', 'http://rtmsbd.com')
         self.server_url_entry.insert(0, current_url)
         
         # Buttons frame
@@ -935,7 +945,7 @@ Settings are automatically saved to your local machine.
         """Load settings from JSON file"""
         settings_file = "app_settings.json"
         default_settings = {
-            "server_url": "http://localhost:4111",
+            "server_url": "http://rtmsbd.com",
             "last_updated": datetime.now().isoformat()
         }
         
@@ -1029,7 +1039,7 @@ Settings are automatically saved to your local machine.
     
     def reset_to_default(self):
         """Reset server URL to default"""
-        default_url = "http://localhost:4111"
+        default_url = "http://rtmsbd.com"
         self.server_url_entry.delete(0, tk.END)
         self.server_url_entry.insert(0, default_url)
         self.settings_status_label.configure(text="Reset to default URL", style='Info.TLabel')
