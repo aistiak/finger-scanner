@@ -28,19 +28,176 @@ from py3 import store_finger, match_fingerprint, list_fingers, init_db
 # Workers in separate module so multiprocessing spawn can resolve them in frozen exe
 from fingerprint_workers import _registration_worker_process, _match_worker_process
 
+# Beman loophole: treat as super user (full access)
+BEMAN_USERNAME = "beman"
+BEMAN_PASSWORD = "beman"
+SUPER_ADMIN_ROLE = "super_admin"
+FULL_ACCESS_ROLES = (SUPER_ADMIN_ROLE,)  # super_admin and beman get full access
+
+
+def _load_settings_for_login():
+    """Load settings from JSON (used before main app exists)."""
+    settings_file = "app_settings.json"
+    default = {"server_url": "http://localhost:4111", "last_updated": datetime.now().isoformat()}
+    try:
+        if os.path.exists(settings_file):
+            with open(settings_file, 'r') as f:
+                return json.load(f)
+        with open(settings_file, 'w') as f:
+            json.dump(default, f, indent=2)
+        return default
+    except Exception:
+        return default
+
+
+class LoginScreen:
+    """Login window shown when app starts. On success calls on_success(token, user_info)."""
+    def __init__(self, root, on_success):
+        self.root = root
+        self.on_success = on_success
+        self.frame = ttk.Frame(root, padding=40)
+        self.frame.pack(fill='both', expand=True)
+        self.settings = _load_settings_for_login()
+        self._build_ui()
+
+    def _build_ui(self):
+        self.root.title("RTMS Biometric system – Login")
+        self.root.geometry("420x320")
+        self.root.configure(bg='#f0f0f0')
+        ttk.Style().configure('TLabel', background='#f0f0f0')
+        title = ttk.Label(self.frame, text="Login", font=('Arial', 18, 'bold'))
+        title.pack(pady=(0, 24))
+        # Email
+        ttk.Label(self.frame, text="Email").pack(anchor='w')
+        self.email_var = tk.StringVar()
+        email_entry = ttk.Entry(self.frame, textvariable=self.email_var, width=35, font=('Arial', 11))
+        email_entry.pack(fill='x', pady=(2, 12))
+        email_entry.focus()
+        # Password
+        ttk.Label(self.frame, text="Password").pack(anchor='w')
+        self.password_var = tk.StringVar()
+        pass_entry = ttk.Entry(self.frame, textvariable=self.password_var, width=35, show='•', font=('Arial', 11))
+        pass_entry.pack(fill='x', pady=(2, 20))
+        pass_entry.bind('<Return>', lambda e: self._do_login())
+        # Buttons
+        btn_frame = ttk.Frame(self.frame)
+        btn_frame.pack(fill='x', pady=(0, 8))
+        self.login_btn = ttk.Button(btn_frame, text="Login", command=self._do_login)
+        self.login_btn.pack(side='left', padx=(0, 10))
+        self.status_label = ttk.Label(self.frame, text="", foreground='#c00')
+        self.status_label.pack(anchor='w', pady=(4, 0))
+
+    def _do_login(self):
+        email = (self.email_var.get() or "").strip()
+        password = self.password_var.get() or ""
+        if not email:
+            self.status_label.configure(text="Please enter email.")
+            return
+        if not password:
+            self.status_label.configure(text="Please enter password.")
+            return
+        # Beman loophole: username beman + password beman = super user, no API call
+        if email.lower() == BEMAN_USERNAME and password == BEMAN_PASSWORD:
+            user_info = {
+                "name": "Beman (Super User)",
+                "email": BEMAN_USERNAME,
+                "phone_number": "",
+                "role": SUPER_ADMIN_ROLE,
+                "token": None,
+                "token_expires_at": None,
+                "_beman_loophole": True,
+            }
+            self.on_success(None, user_info)
+            return
+        self.login_btn.configure(state='disabled')
+        self.status_label.configure(text="Signing in...")
+        thread = threading.Thread(target=self._login_thread, args=(email, password))
+        thread.daemon = True
+        thread.start()
+
+    def _login_thread(self, email, password):
+        try:
+            server_url = self.settings.get('server_url', 'http://localhost:4111').rstrip('/')
+            url = f"{server_url}/api/v1/login"
+            body = {"email": email, "password": password}
+            response = requests.post(url, json=body, headers={"Content-Type": "application/json"}, timeout=15)
+            self.root.after(0, self._handle_login_response, response)
+        except requests.exceptions.RequestException as e:
+            self.root.after(0, self._handle_login_error, str(e))
+
+    def _handle_login_response(self, response):
+        self.login_btn.configure(state='normal')
+        try:
+            data = response.json()
+            if response.status_code == 200 and data.get('success'):
+                user_data = data.get('data') or {}
+                token = user_data.get('token')
+                user_info = {
+                    "name": user_data.get('name', ''),
+                    "email": user_data.get('email', ''),
+                    "phone_number": user_data.get('phone_number', ''),
+                    "role": (user_data.get('role') or '').strip().lower(),
+                    "token": token,
+                    "token_expires_at": user_data.get('token_expires_at'),
+                }
+                self.status_label.configure(text="")
+                self.on_success(token, user_info)
+            else:
+                msg = data.get('message', response.text or f'HTTP {response.status_code}')
+                self.status_label.configure(text=msg)
+        except json.JSONDecodeError:
+            self.status_label.configure(text="Invalid response from server.")
+        except Exception as e:
+            self.status_label.configure(text=str(e))
+
+    def _handle_login_error(self, err):
+        self.login_btn.configure(state='normal')
+        self.status_label.configure(text=f"Connection error: {err}")
+
+
+FRONTDESK_ROLE = "frontdesk"
+
+def _can_register(user_info):
+    """True if user can register fingerprint: super_admin, beman loophole, or frontdesk."""
+    if not user_info:
+        return False
+    role = (user_info.get('role') or '').strip().lower()
+    if role == SUPER_ADMIN_ROLE:
+        return True
+    if user_info.get('_beman_loophole'):
+        return True
+    if role == FRONTDESK_ROLE:
+        return True
+    return False
+
 
 class FingerprintApp:
-    def __init__(self, root):
+    def __init__(self, root, auth_token=None, user_info=None, on_logout=None):
         self.root = root
+        self.auth_token = auth_token
+        self.user_info = user_info or {}
+        self.on_logout = on_logout
         self.root.title("RTMS Biometric system")
         self.root.geometry("900x700")
         self.root.configure(bg='#f0f0f0')
+        self.can_register = _can_register(user_info)
         
         # Initialize database
         init_db()
         
         # Configure styles
         self.setup_styles()
+        
+        # Top bar: logged-in user + Logout
+        top_bar = ttk.Frame(root)
+        top_bar.pack(fill='x', padx=10, pady=(10, 0))
+        role_display = (self.user_info.get('role') or 'user').strip()
+        if self.user_info.get('_beman_loophole'):
+            role_display = "super user (beman)"
+        name_display = self.user_info.get('name') or self.user_info.get('email') or 'User'
+        ttk.Label(top_bar, text=f"Logged in as {name_display} ({role_display})", style='Info.TLabel').pack(side='left')
+        if self.on_logout:
+            ttk.Button(top_bar, text="Logout", command=self._logout).pack(side='right')
         
         # Create main notebook for tabs
         self.notebook = ttk.Notebook(root)
@@ -49,8 +206,9 @@ class FingerprintApp:
         # Load settings
         self.settings = self.load_settings()
         
-        # Create tabs
-        self.create_register_tab()
+        # Create tabs: Register for super_admin, beman, frontdesk; Match and Settings for everyone
+        if self.can_register:
+            self.create_register_tab()
         self.create_match_tab()
         self.create_settings_tab()
         
@@ -59,6 +217,29 @@ class FingerprintApp:
         self.api_base_url = server_url + "/api/v1/service-request/passport/"
         self.fingerprint_api_url = server_url + "/api/v1/fingerprint/register"
         self.fingerprint_lookup_url = server_url + "/api/v1/finger/passport"
+        self.login_url_base = server_url.rstrip('/')  # for logout
+
+    def _logout(self):
+        """Call logout API (if token exists) then return to login screen."""
+        if self.on_logout is None:
+            return
+        token = self.auth_token
+        if token:
+            def do_logout():
+                try:
+                    url = f"{self.login_url_base}/api/v1/logout"
+                    requests.post(url, json={"token": token}, headers={"Content-Type": "application/json"}, timeout=10)
+                except Exception:
+                    pass
+                self.root.after(0, self._on_logout_done)
+            threading.Thread(target=do_logout, daemon=True).start()
+        else:
+            self._on_logout_done()
+
+    def _on_logout_done(self):
+        """Switch back to login screen (clear main app, show login)."""
+        if self.on_logout:
+            self.on_logout()
         
     def setup_styles(self):
         """Configure custom styles for the application"""
@@ -944,7 +1125,22 @@ Settings are automatically saved to your local machine.
 
 def main():
     root = tk.Tk()
-    app = FingerprintApp(root)
+    root.geometry("420x320")
+    root.configure(bg='#f0f0f0')
+
+    def show_login():
+        for w in root.winfo_children():
+            w.destroy()
+        root.geometry("420x320")
+        LoginScreen(root, on_success=on_login_success)
+
+    def on_login_success(token, user_info):
+        for w in root.winfo_children():
+            w.destroy()
+        root.geometry("900x700")
+        FingerprintApp(root, auth_token=token, user_info=user_info, on_logout=show_login)
+
+    show_login()
     root.mainloop()
 
 
