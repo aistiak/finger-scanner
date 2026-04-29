@@ -606,7 +606,14 @@ Settings are automatically saved to your local machine.
         """Get photo URL or base64 string from API response, and emoji. Returns (source_string or None, emoji)."""
         gender = (user_data.get('gender') or '').lower()
         emoji = '👩' if gender == 'female' else '👨'
-        photo_source = self._find_photo_in_dict(user_data)
+        # Prefer top-level "photo" key (API returns photo URL here, e.g. with passport_number, full_name)
+        photo_source = None
+        if isinstance(user_data, dict):
+            raw = user_data.get('photo')
+            if isinstance(raw, str) and raw.strip():
+                photo_source = raw.strip()
+        if not photo_source:
+            photo_source = self._find_photo_in_dict(user_data)
         if not photo_source:
             return None, emoji
         # Resolve relative paths (e.g. /storage/photos/patient_xxx.jpeg)
