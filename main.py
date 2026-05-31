@@ -13,6 +13,28 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from py3 import store_finger, match_fingerprint, list_fingers, init_db
 
 
+def format_fingerprint_error(exc: Exception) -> str:
+    """Turn pyzkfp / scanner errors into actionable messages."""
+    name = type(exc).__name__
+    msg = str(exc)
+    if "capture library" in msg.lower() or name == "CaptureLibraryInitializationError":
+        return (
+            "Fingerprint capture library failed to initialize.\n\n"
+            "• Fix the SLK20R / ZKTeco driver in Device Manager (yellow warning).\n"
+            "• Reinstall ZKFinger SDK from ZKTeco (run as Administrator).\n"
+            "• Ensure the scanner is USB-connected to this Windows VM (Parallels passthrough).\n"
+            "• Run with 64-bit Python: .venv-x64\\Scripts\\python.exe main.py\n\n"
+            f"Technical detail: {msg}"
+        )
+    if "algorithm library" in msg.lower() or name == "AlgorithmLibraryInitializationError":
+        return (
+            "Fingerprint algorithm library failed to initialize.\n"
+            "Install or repair the ZKFinger SDK, then reconnect the scanner.\n\n"
+            f"Technical detail: {msg}"
+        )
+    return msg
+
+
 class FingerprintApp:
     def __init__(self, root):
         self.root = root
@@ -559,7 +581,7 @@ Settings are automatically saved to your local machine.
                 self.root.after(0, self._fingerprint_registration_error, f"API Error: {response.status_code} - {response.text}")
                 
         except Exception as e:
-            self.root.after(0, self._fingerprint_registration_error, str(e))
+            self.root.after(0, self._fingerprint_registration_error, format_fingerprint_error(e))
     
     def _update_registration_status(self, message):
         """Update registration status in GUI"""
@@ -681,7 +703,7 @@ Settings are automatically saved to your local machine.
             self.root.after(0, self._handle_match_result, match_result > 0)
             
         except Exception as e:
-            self.root.after(0, self._handle_match_error, str(e))
+            self.root.after(0, self._handle_match_error, format_fingerprint_error(e))
             
     def _update_match_status(self, message):
         """Update match status in GUI"""
