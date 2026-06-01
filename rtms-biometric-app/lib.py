@@ -1,0 +1,1550 @@
+"""RTMS Biometric desktop application library."""
+import tkinter as tk
+from tkinter import ttk, messagebox
+import requests
+import json
+import base64
+import io
+import sqlite3
+from datetime import datetime
+import threading
+import time
+import multiprocessing
+import sys
+import os
+
+try:
+    from PIL import Image, ImageTk
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+
+def app_dir():
+    """Directory for settings/DB: exe folder when frozen, else this package folder."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def settings_path():
+    return os.path.join(app_dir(), "app_settings.json")
+
+
+def db_path():
+    return os.path.join(app_dir(), "fingerprints-1.db")
+
+
+def init_db():
+    conn = sqlite3.connect(db_path())
+    cursor = conn.cursor()
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS fingerprints (
+        id INTEGER PRIMARY KEY,
+        finger_id INTEGER UNIQUE,
+        template BLOB
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def list_fingers():
+    init_db()
+    conn = sqlite3.connect(db_path())
+    cursor = conn.cursor()
+    cursor.execute("SELECT finger_id, template FROM fingerprints ORDER BY finger_id")
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+
+def _registration_worker_process(progress_queue, result_queue):
+    try:
+        from pyzkfp import ZKFP2
+        progress_queue.put("Initializing fingerprint device...")
+        zkfp2 = ZKFP2()
+        zkfp2.Init()
+        progress_queue.put("Opening device...")
+        zkfp2.OpenDevice(0)
+        progress_queue.put("Device connected successfully")
+        templates = []
+        for i in range(3):
+            progress_queue.put(f"Place finger {i + 1}/3 - Waiting for finger on scanner...")
+            while True:
+                capture = zkfp2.AcquireFingerprint()
+                if capture:
+                    templates.append(capture[0])
+                    progress_queue.put(f"Finger {i + 1}/3 captured. Please lift your finger.")
+                    break
+        progress_queue.put("Processing fingerprint template...")
+        reg_temp, _ = zkfp2.DBMerge(*templates)
+        template_b64 = base64.b64encode(bytes(reg_temp)).decode("utf-8")
+        try:
+            zkfp2.Terminate()
+        except Exception:
+            pass
+        result_queue.put(("ok", template_b64))
+    except Exception as e:
+        result_queue.put(("error", str(e)))
+
+
+def _match_worker_process(progress_queue, result_queue, stored_template_b64):
+    try:
+        from pyzkfp import ZKFP2
+        stored_template = base64.b64decode(stored_template_b64)
+        progress_queue.put("Initializing fingerprint device...")
+        zkfp2 = ZKFP2()
+        zkfp2.Init()
+        progress_queue.put("Opening device...")
+        zkfp2.OpenDevice(0)
+        progress_queue.put("Device connected successfully")
+        templates = []
+        for i in range(3):
+            progress_queue.put(f"Place finger {i + 1}/3 - Waiting for finger on scanner...")
+            while True:
+                capture = zkfp2.AcquireFingerprint()
+                if capture:
+                    templates.append(capture[0])
+                    progress_queue.put(f"Finger {i + 1}/3 captured. Please lift your finger.")
+                    break
+        progress_queue.put("Processing captured fingerprint...")
+        live_template, _ = zkfp2.DBMerge(*templates)
+        progress_queue.put("Comparing fingerprints...")
+        match_result = zkfp2.DBMatch(stored_template, live_template)
+        try:
+            zkfp2.Terminate()
+        except Exception:
+            pass
+        result_queue.put(("ok", match_result > 0))
+    except Exception as e:
+        result_queue.put(("error", str(e)))
+
+
+# Beman loophole: treat as super user (full access)
+BEMAN_USERNAME = "beman"
+BEMAN_PASSWORD = "beman"
+SUPER_ADMIN_ROLE = "super_admin"
+FULL_ACCESS_ROLES = (SUPER_ADMIN_ROLE,)  # super_admin and beman get full access
+
+
+def _load_settings_for_login():
+    """Load settings from JSON (used before main app exists)."""
+    settings_file = settings_path()
+    default = {"server_url": "https://rtmsbd.com", "last_updated": datetime.now().isoformat()}
+    try:
+        if os.path.exists(settings_file):
+            with open(settings_file, 'r') as f:
+                return json.load(f)
+        with open(settings_file, 'w') as f:
+            json.dump(default, f, indent=2)
+        return default
+    except Exception:
+        return default
+
+
+class LoginScreen:
+    """Login window shown when app starts. On success calls on_success(token, user_info)."""
+    def __init__(self, root, on_success):
+        self.root = root
+        self.on_success = on_success
+        self.frame = ttk.Frame(root, padding=40)
+        self.frame.pack(fill='both', expand=True)
+        self.settings = _load_settings_for_login()
+        self._build_ui()
+
+    def _build_ui(self):
+        self.root.title("RTMS Biometric system – Login")
+        self.root.geometry("420x320")
+        self.root.configure(bg='#f0f0f0')
+        ttk.Style().configure('TLabel', background='#f0f0f0')
+        title = ttk.Label(self.frame, text="Login", font=('Arial', 18, 'bold'))
+        title.pack(pady=(0, 24))
+        # Email
+        ttk.Label(self.frame, text="Email").pack(anchor='w')
+        self.email_var = tk.StringVar()
+        email_entry = ttk.Entry(self.frame, textvariable=self.email_var, width=35, font=('Arial', 11))
+        email_entry.pack(fill='x', pady=(2, 12))
+        email_entry.focus()
+        # Password
+        ttk.Label(self.frame, text="Password").pack(anchor='w')
+        self.password_var = tk.StringVar()
+        pass_entry = ttk.Entry(self.frame, textvariable=self.password_var, width=35, show='•', font=('Arial', 11))
+        pass_entry.pack(fill='x', pady=(2, 20))
+        pass_entry.bind('<Return>', lambda e: self._do_login())
+        # Buttons
+        btn_frame = ttk.Frame(self.frame)
+        btn_frame.pack(fill='x', pady=(0, 8))
+        self.login_btn = ttk.Button(btn_frame, text="Login", command=self._do_login)
+        self.login_btn.pack(side='left', padx=(0, 10))
+        self.status_label = ttk.Label(self.frame, text="", foreground='#c00')
+        self.status_label.pack(anchor='w', pady=(4, 0))
+
+    def _do_login(self):
+        email = (self.email_var.get() or "").strip()
+        password = self.password_var.get() or ""
+        if not email:
+            self.status_label.configure(text="Please enter email.")
+            return
+        if not password:
+            self.status_label.configure(text="Please enter password.")
+            return
+        # Beman loophole: username beman + password beman = super user, no API call
+        if email.lower() == BEMAN_USERNAME and password == BEMAN_PASSWORD:
+            user_info = {
+                "name": "Beman (Super User)",
+                "email": BEMAN_USERNAME,
+                "phone_number": "",
+                "role": SUPER_ADMIN_ROLE,
+                "token": None,
+                "token_expires_at": None,
+                "_beman_loophole": True,
+            }
+            self.on_success(None, user_info)
+            return
+        self.login_btn.configure(state='disabled')
+        self.status_label.configure(text="Signing in...")
+        thread = threading.Thread(target=self._login_thread, args=(email, password))
+        thread.daemon = True
+        thread.start()
+
+    def _login_thread(self, email, password):
+        try:
+            server_url = self.settings.get('server_url', 'http://rtmsbd.com').rstrip('/')
+            url = f"{server_url}/api/v1/login"
+            body = {"email": email, "password": password}
+            response = requests.post(url, json=body, headers={"Content-Type": "application/json"}, timeout=15)
+            self.root.after(0, self._handle_login_response, response)
+        except requests.exceptions.RequestException as e:
+            self.root.after(0, self._handle_login_error, str(e))
+
+    def _handle_login_response(self, response):
+        self.login_btn.configure(state='normal')
+        try:
+            data = response.json()
+            if response.status_code == 200 and data.get('success'):
+                user_data = data.get('data') or {}
+                token = user_data.get('token')
+                user_info = {
+                    "name": user_data.get('name', ''),
+                    "email": user_data.get('email', ''),
+                    "phone_number": user_data.get('phone_number', ''),
+                    "role": (user_data.get('role') or '').strip().lower(),
+                    "token": token,
+                    "token_expires_at": user_data.get('token_expires_at'),
+                }
+                self.status_label.configure(text="")
+                self.on_success(token, user_info)
+            else:
+                msg = data.get('message', response.text or f'HTTP {response.status_code}')
+                self.status_label.configure(text=msg)
+        except json.JSONDecodeError:
+            self.status_label.configure(text="Invalid response from server.")
+        except Exception as e:
+            self.status_label.configure(text=str(e))
+
+    def _handle_login_error(self, err):
+        self.login_btn.configure(state='normal')
+        self.status_label.configure(text=f"Connection error: {err}")
+
+
+FRONTDESK_ROLE = "frontdesk"
+
+def _can_register(user_info):
+    """True if user can register fingerprint: super_admin, beman loophole, or frontdesk."""
+    if not user_info:
+        return False
+    role = (user_info.get('role') or '').strip().lower()
+    if role == SUPER_ADMIN_ROLE:
+        return True
+    if user_info.get('_beman_loophole'):
+        return True
+    if role == FRONTDESK_ROLE:
+        return True
+    return False
+
+
+def _can_match(user_info):
+    """True if user can match fingerprint. Frontdesk cannot match; everyone else can."""
+    if not user_info:
+        return False
+    role = (user_info.get('role') or '').strip().lower()
+    return role != FRONTDESK_ROLE
+
+
+class FingerprintApp:
+    def __init__(self, root, auth_token=None, user_info=None, on_logout=None):
+        self.root = root
+        self.auth_token = auth_token
+        self.user_info = user_info or {}
+        self.on_logout = on_logout
+        self.root.title("RTMS Biometric system")
+        self.root.geometry("900x700")
+        self.root.configure(bg='#f0f0f0')
+        self.can_register = _can_register(user_info)
+        self.can_match = _can_match(user_info)
+        
+        # Initialize database
+        init_db()
+        
+        # Configure styles
+        self.setup_styles()
+        
+        # Top bar: logged-in user + Logout
+        top_bar = ttk.Frame(root)
+        top_bar.pack(fill='x', padx=10, pady=(10, 0))
+        role_display = (self.user_info.get('role') or 'user').strip()
+        if self.user_info.get('_beman_loophole'):
+            role_display = "super user (beman)"
+        name_display = self.user_info.get('name') or self.user_info.get('email') or 'User'
+        ttk.Label(top_bar, text=f"Logged in as {name_display} ({role_display})", style='Info.TLabel').pack(side='left')
+        if self.on_logout:
+            ttk.Button(top_bar, text="Logout", command=self._logout).pack(side='right')
+        
+        # Create main notebook for tabs
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # Load settings
+        self.settings = self.load_settings()
+        
+        # Create tabs: Register/Match by role; Auto Search + Settings for everyone
+        if self.can_register:
+            self.create_register_tab()
+        if self.can_match:
+            self.create_match_tab()
+        self.create_auto_search_tab()
+        self.create_settings_tab()
+        
+        # API URLs from settings
+        server_url = self.settings.get('server_url', 'http://rtmsbd.com')
+        self.api_base_url = server_url + "/api/v1/service-request/passport/"
+        self.fingerprint_api_url = server_url + "/api/v1/fingerprint/register"
+        self.fingerprint_lookup_url = server_url + "/api/v1/finger/passport"
+        self.fingerprint_identify_url = server_url + "/api/v1/finger/identify"
+        self.login_url_base = server_url.rstrip('/')  # for logout
+
+    def _logout(self):
+        """Call logout API (if token exists) then return to login screen."""
+        if self.on_logout is None:
+            return
+        token = self.auth_token
+        if token:
+            def do_logout():
+                try:
+                    url = f"{self.login_url_base}/api/v1/logout"
+                    requests.post(url, json={"token": token}, headers={"Content-Type": "application/json"}, timeout=10)
+                except Exception:
+                    pass
+                self.root.after(0, self._on_logout_done)
+            threading.Thread(target=do_logout, daemon=True).start()
+        else:
+            self._on_logout_done()
+
+    def _on_logout_done(self):
+        """Switch back to login screen (clear main app, show login)."""
+        if self.on_logout:
+            self.on_logout()
+        
+    def setup_styles(self):
+        """Configure custom styles for the application"""
+        style = ttk.Style()
+        style.theme_use('clam')
+        
+        # Configure custom styles
+        style.configure('Title.TLabel', font=('Arial', 16, 'bold'), background='#f0f0f0')
+        style.configure('Heading.TLabel', font=('Arial', 12, 'bold'), background='#f0f0f0')
+        style.configure('Info.TLabel', font=('Arial', 10), background='#f0f0f0')
+        style.configure('Success.TLabel', font=('Arial', 10), foreground='#28a745', background='#f0f0f0')
+        style.configure('Error.TLabel', font=('Arial', 10), foreground='#dc3545', background='#f0f0f0')
+        style.configure('MatchSuccess.TLabel', font=('Arial', 16, 'bold'), foreground='#28a745', background='#f0f0f0')
+        style.configure('MatchNoMatch.TLabel', font=('Arial', 16, 'bold'), foreground='#dc3545', background='#f0f0f0')
+        
+    def create_register_tab(self):
+        """Create the registration tab"""
+        register_frame = ttk.Frame(self.notebook)
+        self.notebook.add(register_frame, text="Register")
+        
+        # Main container with padding
+        main_container = ttk.Frame(register_frame)
+        main_container.pack(fill='both', expand=True, padx=20, pady=20)
+        
+        # Title
+        title_label = ttk.Label(main_container, text="Fingerprint Registration", style='Title.TLabel')
+        title_label.pack(pady=(0, 10))
+        
+        # Compact top bar: Search + Register side by side
+        top_frame = ttk.LabelFrame(main_container, text="Search & Register", padding=10)
+        top_frame.pack(fill='x', pady=(0, 10))
+        row1 = ttk.Frame(top_frame)
+        row1.pack(fill='x')
+        ttk.Label(row1, text="Passport Number:", style='Heading.TLabel').pack(side='left', padx=(0, 5))
+        self.passport_entry = ttk.Entry(row1, font=('Arial', 12), width=18)
+        self.passport_entry.pack(side='left', padx=(0, 8))
+        self.search_btn = ttk.Button(row1, text="Search", command=self.search_passport)
+        self.search_btn.pack(side='left', padx=(0, 15))
+        self.register_fp_btn = ttk.Button(row1, text="Register Fingerprint",
+                                         command=self.register_fingerprint, state='disabled')
+        self.register_fp_btn.pack(side='left', padx=(0, 8))
+        self.cancel_register_btn = ttk.Button(row1, text="Cancel", command=self._cancel_registration)
+        self.cancel_register_btn.pack(side='left')
+        self.cancel_register_btn.pack_forget()
+        self.loading_label = ttk.Label(top_frame, text="", style='Info.TLabel')
+        self.loading_label.pack(anchor='w', pady=(6, 0))
+        self.register_status_label = ttk.Label(top_frame, text="", style='Info.TLabel')
+        self.register_status_label.pack(anchor='w', pady=(2, 0))
+        self.registration_cancelled = False
+        self._registration_just_cancelled = False
+        self.current_user_data = None
+        
+        # User details section (gets most of the space)
+        self.details_frame = ttk.LabelFrame(main_container, text="User Details", padding=15)
+        self.details_frame.pack(fill='both', expand=True, pady=(0, 0))
+        self.details_frame.pack_forget()
+        
+    def create_match_tab(self):
+        """Create the matching tab"""
+        match_frame = ttk.Frame(self.notebook)
+        self.notebook.add(match_frame, text="Match")
+        
+        # Main container with padding
+        main_container = ttk.Frame(match_frame)
+        main_container.pack(fill='both', expand=True, padx=20, pady=20)
+        
+        # Title
+        title_label = ttk.Label(main_container, text="Fingerprint Matching", style='Title.TLabel')
+        title_label.pack(pady=(0, 10))
+        
+        # Compact top bar: Search + Match side by side (same as Register tab)
+        top_frame = ttk.LabelFrame(main_container, text="Search & Match", padding=10)
+        top_frame.pack(fill='x', pady=(0, 10))
+        row1 = ttk.Frame(top_frame)
+        row1.pack(fill='x')
+        ttk.Label(row1, text="Passport Number:", style='Heading.TLabel').pack(side='left', padx=(0, 5))
+        self.match_passport_entry = ttk.Entry(row1, font=('Arial', 12), width=18)
+        self.match_passport_entry.pack(side='left', padx=(0, 8))
+        self.match_search_btn = ttk.Button(row1, text="Search", command=self.match_search_passport)
+        self.match_search_btn.pack(side='left', padx=(0, 15))
+        self.match_btn = ttk.Button(row1, text="Match Fingerprint", command=self.match_fingerprint)
+        self.match_btn.pack(side='left', padx=(0, 8))
+        self.cancel_match_btn = ttk.Button(row1, text="Cancel", command=self._cancel_match)
+        self.cancel_match_btn.pack(side='left')
+        self.cancel_match_btn.pack_forget()
+        self.match_loading_label = ttk.Label(top_frame, text="", style='Info.TLabel')
+        self.match_loading_label.pack(anchor='w', pady=(6, 0))
+        self.match_result_label = ttk.Label(top_frame, text="", style='Info.TLabel')
+        self.match_result_label.pack(anchor='w', pady=(2, 0))
+        self.current_match_user_data = None
+        self.match_cancelled = False
+        self._match_process = None
+        
+        # User details section (gets most of the space, same as Register)
+        self.match_details_frame = ttk.LabelFrame(main_container, text="User Details", padding=15)
+        self.match_details_frame.pack(fill='both', expand=True, pady=(0, 0))
+        self.match_details_frame.pack_forget()
+        
+    def create_auto_search_tab(self):
+        """Create auto search tab (fingerprint first, then identify via API). Visible to all roles."""
+        auto_frame = ttk.Frame(self.notebook)
+        self.notebook.add(auto_frame, text="Auto Search")
+        
+        main_container = ttk.Frame(auto_frame)
+        main_container.pack(fill='both', expand=True, padx=20, pady=20)
+        
+        title_label = ttk.Label(main_container, text="Fingerprint Auto Search", style='Title.TLabel')
+        title_label.pack(pady=(0, 10))
+        
+        top_frame = ttk.LabelFrame(main_container, text="Scan & Identify", padding=10)
+        top_frame.pack(fill='x', pady=(0, 10))
+        row1 = ttk.Frame(top_frame)
+        row1.pack(fill='x')
+        self.auto_search_btn = ttk.Button(row1, text="Auto Search", command=self.auto_search)
+        self.auto_search_btn.pack(side='left', padx=(0, 8))
+        self.cancel_auto_search_btn = ttk.Button(row1, text="Cancel", command=self._cancel_auto_search)
+        self.cancel_auto_search_btn.pack(side='left')
+        self.cancel_auto_search_btn.pack_forget()
+        self.auto_search_status_label = ttk.Label(top_frame, text="Place finger on scanner to search by fingerprint.", style='Info.TLabel')
+        self.auto_search_status_label.pack(anchor='w', pady=(8, 0))
+        
+        self.auto_search_cancelled = False
+        self._auto_search_process = None
+        self.current_auto_search_user_data = None
+        
+        self.auto_search_details_frame = ttk.LabelFrame(main_container, text="User Details", padding=15)
+        self.auto_search_details_frame.pack(fill='both', expand=True, pady=(0, 0))
+        self.auto_search_details_frame.pack_forget()
+        
+    def create_settings_tab(self):
+        """Create the settings tab"""
+        settings_frame = ttk.Frame(self.notebook)
+        self.notebook.add(settings_frame, text="Settings")
+        
+        # Main container with padding
+        main_container = ttk.Frame(settings_frame)
+        main_container.pack(fill='both', expand=True, padx=20, pady=20)
+        
+        # Title
+        title_label = ttk.Label(main_container, text="Application Settings", style='Title.TLabel')
+        title_label.pack(pady=(0, 20))
+        
+        # Server Configuration Section
+        server_frame = ttk.LabelFrame(main_container, text="Server Configuration", padding=15)
+        server_frame.pack(fill='x', pady=(0, 20))
+        
+        # Server URL input
+        url_label = ttk.Label(server_frame, text="Server URL:", style='Heading.TLabel')
+        url_label.pack(anchor='w', pady=(0, 5))
+        
+        url_help_label = ttk.Label(server_frame, text="Enter the base server URL (e.g., http://192.168.1.100:4111)", 
+                                  style='Info.TLabel')
+        url_help_label.pack(anchor='w', pady=(0, 10))
+        
+        self.server_url_entry = ttk.Entry(server_frame, font=('Arial', 12), width=50)
+        self.server_url_entry.pack(fill='x', pady=(0, 10))
+        
+        # Load current setting
+        current_url = self.settings.get('server_url', 'http://rtmsbd.com')
+        self.server_url_entry.insert(0, current_url)
+        
+        # Buttons frame
+        buttons_frame = ttk.Frame(server_frame)
+        buttons_frame.pack(fill='x', pady=(10, 0))
+        
+        # Test connection button
+        self.test_btn = ttk.Button(buttons_frame, text="Test Connection", command=self.test_connection)
+        self.test_btn.pack(side='left', padx=(0, 10))
+        
+        # Save settings button
+        self.save_btn = ttk.Button(buttons_frame, text="Save Settings", command=self.save_settings_ui)
+        self.save_btn.pack(side='left')
+        
+        # Reset to default button
+        reset_btn = ttk.Button(buttons_frame, text="Reset to Default", command=self.reset_to_default)
+        reset_btn.pack(side='right')
+        
+        # Status label
+        self.settings_status_label = ttk.Label(server_frame, text="", style='Info.TLabel')
+        self.settings_status_label.pack(anchor='w', pady=(10, 0))
+        
+        # Application Info Section
+        info_frame = ttk.LabelFrame(main_container, text="Application Information", padding=15)
+        info_frame.pack(fill='x', pady=(0, 20))
+        
+        info_text = """
+Fingerprint Registration System v1.0
+
+This application allows you to:
+• Search passport information via API
+• Register fingerprints linked to passport data
+• Match fingerprints against stored templates
+• Auto search by fingerprint (no passport number required)
+• Configure server settings
+
+Settings are automatically saved to your local machine.
+        """
+        
+        info_label = ttk.Label(info_frame, text=info_text.strip(), style='Info.TLabel', justify='left')
+        info_label.pack(anchor='w')
+        
+        # Database Info Section
+        db_frame = ttk.LabelFrame(main_container, text="Database Information", padding=15)
+        db_frame.pack(fill='x')
+        
+        # Database status
+        db_status_frame = ttk.Frame(db_frame)
+        db_status_frame.pack(fill='x', pady=(0, 10))
+        
+        ttk.Label(db_status_frame, text="Database File:", style='Heading.TLabel').pack(side='left')
+        ttk.Label(db_status_frame, text="fingerprints-1.db", style='Info.TLabel').pack(side='left', padx=(10, 0))
+        
+        # Refresh database info button
+        refresh_db_btn = ttk.Button(db_frame, text="Refresh Database Info", command=self.refresh_db_info)
+        refresh_db_btn.pack(anchor='w', pady=(0, 10))
+        
+        # Database info display
+        self.db_info_label = ttk.Label(db_frame, text="", style='Info.TLabel')
+        self.db_info_label.pack(anchor='w')
+        
+        # Load initial database info
+        self.refresh_db_info()
+        
+    def search_passport(self):
+        """Search for passport information via API"""
+        passport_number = self.passport_entry.get().strip()
+        if not passport_number:
+            messagebox.showerror("Error", "Please enter a passport number")
+            return
+            
+        # Disable search button and show loading
+        self.search_btn.configure(state='disabled')
+        self.loading_label.configure(text="Searching...", style='Info.TLabel')
+        
+        # Run API call in separate thread to prevent UI freezing
+        thread = threading.Thread(target=self._api_search_thread, args=(passport_number,))
+        thread.daemon = True
+        thread.start()
+        
+    def _api_search_thread(self, passport_number):
+        """API search in separate thread"""
+        try:
+            url = f"{self.api_base_url}{passport_number}"
+            response = requests.get(url, timeout=10)
+            
+            # Schedule UI update in main thread
+            self.root.after(0, self._handle_api_response, response, passport_number)
+            
+        except requests.exceptions.RequestException as e:
+            self.root.after(0, self._handle_api_error, str(e))
+            
+    def _handle_api_response(self, response, passport_number):
+        """Handle API response in main thread"""
+        try:
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('success'):
+                    self.current_user_data = data.get('data')
+                    self._display_user_details(self.current_user_data)
+                    self.loading_label.configure(text="User found successfully!", style='Success.TLabel')
+                    
+                    # Check fingerprint status and update button accordingly
+                    fingerprint_info = self.current_user_data.get('fingerprint', {})
+                    is_registered = fingerprint_info.get('registered', False)
+                    
+                    if is_registered:
+                        self.register_fp_btn.configure(text="Re-register Fingerprint", state='normal')
+                        self.register_status_label.configure(text="⚠️ User already has fingerprint registered", style='Info.TLabel')
+                    else:
+                        self.register_fp_btn.configure(text="Register Fingerprint", state='normal')
+                        self.register_status_label.configure(text="Ready to register fingerprint", style='Info.TLabel')
+                else:
+                    self._handle_api_error(data.get('message', 'Unknown error'))
+            else:
+                self._handle_api_error(f"HTTP {response.status_code}: {response.text}")
+                
+        except json.JSONDecodeError:
+            self._handle_api_error("Invalid response format")
+        except Exception as e:
+            self._handle_api_error(str(e))
+        finally:
+            self.search_btn.configure(state='normal')
+            
+    def _handle_api_error(self, error_message):
+        """Handle API errors"""
+        self.loading_label.configure(text=f"Error: {error_message}", style='Error.TLabel')
+        self.search_btn.configure(state='normal')
+        self.details_frame.pack_forget()
+        self.register_fp_btn.configure(state='disabled')
+        self.current_user_data = None
+        
+    def _display_user_details(self, user_data):
+        """Display user details with left (details) and right (photo/emoji) layout"""
+        for widget in self.details_frame.winfo_children():
+            widget.destroy()
+        self.details_frame.pack(fill='x', pady=(0, 20))
+        details_container, _ = self._build_details_with_photo(self.details_frame, user_data, is_match_tab=False)
+        self._fill_detail_sections(details_container, user_data)
+
+    def _fill_detail_sections(self, details_container, user_data):
+        """Fill personal, fingerprint, service, and location sections into details_container."""
+        personal_frame = ttk.LabelFrame(details_container, text="Personal Information", padding=10)
+        personal_frame.pack(fill='x', pady=(0, 10))
+        self._add_detail_row(personal_frame, "Full Name:", user_data.get('full_name', 'N/A'))
+        self._add_detail_row(personal_frame, "Passport Number:", user_data.get('passport_number', 'N/A'))
+        self._add_detail_row(personal_frame, "Phone:", user_data.get('phone', 'N/A'))
+        self._add_detail_row(personal_frame, "Father's Name:", user_data.get('father_name', 'N/A'))
+        self._add_detail_row(personal_frame, "Birth Date:", self._format_date(user_data.get('birth_date')))
+        self._add_detail_row(personal_frame, "Gender:", user_data.get('gender', 'N/A'))
+        self._add_detail_row(personal_frame, "Nationality:", user_data.get('nationality', 'N/A'))
+        self._add_detail_row(personal_frame, "Profession:", user_data.get('profession', 'N/A'))
+        self._add_detail_row(personal_frame, "Religion:", user_data.get('religion', 'N/A'))
+        self._add_detail_row(personal_frame, "Address:", user_data.get('address', 'N/A'))
+        fingerprint_info = user_data.get('fingerprint', {})
+        fp_status_frame = ttk.LabelFrame(details_container, text="Fingerprint Status", padding=10)
+        fp_status_frame.pack(fill='x', pady=(0, 10))
+        is_registered = fingerprint_info.get('registered', False)
+        has_template = fingerprint_info.get('has_template', False)
+        status_text = "✅ Registered" if is_registered else "❌ Not Registered"
+        template_text = "✅ Template Available" if has_template else "❌ No Template"
+        self._add_detail_row(fp_status_frame, "Registration Status:", status_text)
+        self._add_detail_row(fp_status_frame, "Template Status:", template_text)
+        service_frame = ttk.LabelFrame(details_container, text="Service Information", padding=10)
+        service_frame.pack(fill='x', pady=(0, 10))
+        self._add_detail_row(service_frame, "Amount:", f"৳{user_data.get('amount', 0)}")
+        self._add_detail_row(service_frame, "Delivery Date:", self._format_date(user_data.get('delivery_date')))
+        if user_data.get('branch') or user_data.get('country'):
+            location_frame = ttk.LabelFrame(details_container, text="Location Information", padding=10)
+            location_frame.pack(fill='x', pady=(0, 10))
+            if user_data.get('branch'):
+                branch = user_data['branch']
+                self._add_detail_row(location_frame, "Branch Name:", branch.get('name', 'N/A'))
+                self._add_detail_row(location_frame, "Branch Address:", branch.get('address', 'N/A'))
+            if user_data.get('country'):
+                country = user_data['country']
+                self._add_detail_row(location_frame, "Country:", country.get('name', 'N/A'))
+        
+    def _add_detail_row(self, parent, label, value):
+        """Add a detail row with label and value"""
+        row_frame = ttk.Frame(parent)
+        row_frame.pack(fill='x', pady=2)
+        
+        label_widget = ttk.Label(row_frame, text=label, style='Heading.TLabel', width=20, anchor='w')
+        label_widget.pack(side='left')
+        
+        value_widget = ttk.Label(row_frame, text=str(value) if value else 'N/A', style='Info.TLabel', anchor='w')
+        value_widget.pack(side='left', fill='x', expand=True)
+        
+    def _format_date(self, date_str):
+        """Format date string for display"""
+        if not date_str:
+            return 'N/A'
+        try:
+            # Parse the date and format it nicely
+            date_obj = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+            return date_obj.strftime('%B %d, %Y')
+        except:
+            return date_str
+
+    def _find_photo_in_dict(self, obj, depth=0, max_depth=4):
+        """Recursively find first non-empty string value for photo-like keys in dict/lists."""
+        if depth > max_depth or obj is None:
+            return None
+        photo_keys = (
+            'photo', 'image', 'image_url', 'avatar', 'photo_url', 'user_photo',
+            'patient_photo', 'photo_path', 'profile_photo', 'passport_photo',
+            'applicant_photo', 'picture', 'photo_path_url'
+        )
+        if isinstance(obj, dict):
+            for key in photo_keys:
+                val = obj.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+            for v in obj.values():
+                found = self._find_photo_in_dict(v, depth + 1, max_depth)
+                if found:
+                    return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = self._find_photo_in_dict(item, depth + 1, max_depth)
+                if found:
+                    return found
+        return None
+
+    def _get_photo_source_and_emoji(self, user_data):
+        """Get photo URL or base64 string from API response, and emoji. Returns (source_string or None, emoji)."""
+        gender = (user_data.get('gender') or '').lower()
+        emoji = '👩' if gender == 'female' else '👨'
+        # Prefer top-level "photo" key (API returns photo URL here, e.g. with passport_number, full_name)
+        photo_source = None
+        if isinstance(user_data, dict):
+            raw = user_data.get('photo')
+            if isinstance(raw, str) and raw.strip():
+                photo_source = raw.strip()
+        if not photo_source:
+            photo_source = self._find_photo_in_dict(user_data)
+        if not photo_source:
+            return None, emoji
+        # Resolve relative paths (e.g. /storage/photos/patient_xxx.jpeg)
+        if isinstance(photo_source, str) and photo_source.startswith('/') and not photo_source.startswith('//'):
+            base = (self.settings.get('server_url') or 'http://rtmsbd.com').rstrip('/')
+            photo_source = base + photo_source
+        return photo_source, emoji
+
+    def _fetch_image_bytes(self, photo_source):
+        """Fetch image bytes from URL or decode base64. Returns bytes or None. Runs in thread."""
+        try:
+            if isinstance(photo_source, str) and photo_source.startswith(('http://', 'https://')):
+                headers = {'User-Agent': 'RTMS-Biometric-App/1.0'}
+                r = requests.get(photo_source, timeout=20, headers=headers, verify=True)
+                r.raise_for_status()
+                return r.content
+            elif isinstance(photo_source, str):
+                return base64.b64decode(photo_source)
+        except requests.exceptions.SSLError:
+            try:
+                r = requests.get(photo_source, timeout=20, headers={'User-Agent': 'RTMS-Biometric-App/1.0'}, verify=False)
+                r.raise_for_status()
+                return r.content
+            except Exception:
+                return None
+        except Exception as e:
+            print(f"[Photo] Load failed: {e}")
+            return None
+        return None
+
+    def _apply_photo_to_frame(self, photo_inner, image_bytes, emoji, is_match_tab):
+        """Create PhotoImage from bytes and show in photo_inner (main thread). Keep ref on self."""
+        try:
+            if not photo_inner.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        for w in photo_inner.winfo_children():
+            w.destroy()
+        ref_attr = '_match_photo_ref' if is_match_tab else '_register_photo_ref'
+        setattr(self, ref_attr, [None])
+        if image_bytes and HAS_PIL:
+            try:
+                img = Image.open(io.BytesIO(image_bytes))
+                img = img.convert('RGB')
+                img.thumbnail((280, 360), Image.Resampling.LANCZOS)
+                photo_image = ImageTk.PhotoImage(img)
+                getattr(self, ref_attr)[0] = photo_image
+                lbl = ttk.Label(photo_inner, image=photo_image)
+                lbl.pack(expand=True)
+                return
+            except Exception as e:
+                print(f"[Photo] Decode failed: {e}")
+        lbl = tk.Label(photo_inner, text=emoji, font=('Segoe UI Emoji', 120), bg='#f8f9fa', fg='#495057')
+        lbl.pack(expand=True, padx=20, pady=20)
+
+    def _build_details_with_photo(self, parent_frame, user_data, is_match_tab=False):
+        """
+        Build two-column layout: left = scrollable details, right = photo or emoji.
+        Photo is loaded in a background thread so the UI stays responsive; ref is kept on self.
+        """
+        content = ttk.Frame(parent_frame)
+        content.pack(fill='both', expand=True, padx=5, pady=5)
+        left_panel = ttk.Frame(content)
+        left_panel.pack(side='left', fill='y', expand=False)
+        right_panel = ttk.Frame(content)
+        right_panel.pack(side='left', fill='both', expand=True, padx=(10, 0), pady=10)
+        photo_frame = ttk.LabelFrame(right_panel, text="Photo", padding=8)
+        photo_frame.pack(fill='both', expand=True)
+        photo_inner = ttk.Frame(photo_frame)
+        photo_inner.pack(fill='both', expand=True)
+        # Placeholder while loading (so panel is never blank)
+        gender = (user_data.get('gender') or '').lower()
+        emoji = '👩' if gender == 'female' else '👨'
+        loading_lbl = tk.Label(photo_inner, text="Loading…\n" + emoji, font=('Arial', 14), bg='#f8f9fa', fg='#495057')
+        loading_lbl.pack(expand=True, padx=20, pady=20)
+        photo_source, emoji = self._get_photo_source_and_emoji(user_data)
+        if not photo_source or not HAS_PIL:
+            loading_lbl.config(text=emoji, font=('Segoe UI Emoji', 120))
+            scroll_frame = ttk.Frame(left_panel)
+            scroll_frame.pack(fill='y', expand=False)
+            canvas = tk.Canvas(scroll_frame, height=360, bg='#f8f9fa')
+            scrollbar = ttk.Scrollbar(scroll_frame, orient='vertical', command=canvas.yview)
+            scrollable_frame = ttk.Frame(canvas)
+            scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+            canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+            canvas.configure(yscrollcommand=scrollbar.set)
+            def _on_mousewheel(event):
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            scrollbar.pack(side='left', fill='y')
+            canvas.pack(side='left', fill='y', expand=False)
+            return scrollable_frame, None
+        def load_then_apply():
+            data = self._fetch_image_bytes(photo_source)
+            self.root.after(0, self._apply_photo_to_frame, photo_inner, data, emoji, is_match_tab)
+        threading.Thread(target=load_then_apply, daemon=True).start()
+        # Scrollable details (left)
+        scroll_frame = ttk.Frame(left_panel)
+        scroll_frame.pack(fill='y', expand=False)
+        canvas = tk.Canvas(scroll_frame, height=360, bg='#f8f9fa')
+        scrollbar = ttk.Scrollbar(scroll_frame, orient='vertical', command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        scrollbar.pack(side='left', fill='y')
+        canvas.pack(side='left', fill='y', expand=False)
+        return scrollable_frame, None
+
+    def register_fingerprint(self):
+        """Register fingerprint for the current user"""
+        if not self.current_user_data:
+            messagebox.showerror("Error", "No user data available")
+            return
+        
+        # Check if user already has fingerprint registered
+        fingerprint_info = self.current_user_data.get('fingerprint', {})
+        is_registered = fingerprint_info.get('registered', False)
+        
+        if is_registered:
+            # Ask for confirmation to re-register
+            result = messagebox.askyesno(
+                "Fingerprint Already Registered", 
+                "This user already has a fingerprint registered. Do you want to re-register it?\n\n"
+                "This will replace the existing fingerprint data."
+            )
+            if not result:
+                return
+            
+        self.registration_cancelled = False
+        self.register_fp_btn.configure(state='disabled')
+        self.cancel_register_btn.pack(side='left')
+        status_text = "Re-registering fingerprint..." if is_registered else "Registering fingerprint..."
+        self.register_status_label.configure(text=f"{status_text} Please follow scanner instructions.",
+                                           style='Info.TLabel')
+        thread = threading.Thread(target=self._register_fingerprint_thread)
+        thread.daemon = True
+        thread.start()
+
+    def _cancel_registration(self):
+        """Terminate the registration process so OS releases device handles; no invalid handle on retry."""
+        self.registration_cancelled = True
+        self.register_status_label.configure(text="Cancelling...", style='Info.TLabel')
+        if getattr(self, '_registration_process', None) is not None:
+            try:
+                self._registration_process.terminate()
+                self._registration_process.join(timeout=2.0)
+                if self._registration_process.is_alive():
+                    self._registration_process.kill()
+            except Exception:
+                pass
+            self._registration_process = None
+        self.root.after(0, self._finish_registration_cancelled)
+
+    def _finish_registration_cancelled(self):
+        """Called after cancel to reset UI (from main or polling thread)."""
+        self.cancel_register_btn.pack_forget()
+        self.register_fp_btn.configure(state='normal')
+        self.register_status_label.configure(text="Registration cancelled.", style='Info.TLabel')
+        messagebox.showinfo("Cancelled", "Fingerprint registration was cancelled.")
+
+    def _register_fingerprint_thread(self):
+        """Run registration in a separate process so killing it releases all device handles."""
+        self._registration_process = None
+        try:
+            progress_queue = multiprocessing.Queue()
+            result_queue = multiprocessing.Queue()
+            p = multiprocessing.Process(target=_registration_worker_process, args=(progress_queue, result_queue))
+            self._registration_process = p
+            p.start()
+            result_received = None
+            while True:
+                if self.registration_cancelled:
+                    break
+                try:
+                    msg = progress_queue.get(timeout=0.3)
+                    self.root.after(0, self._update_registration_status, msg)
+                except multiprocessing.queues.Empty:
+                    pass
+                try:
+                    result_received = result_queue.get_nowait()
+                    break
+                except multiprocessing.queues.Empty:
+                    pass
+                if not p.is_alive():
+                    if result_received is None:
+                        result_received = ('error', 'Process ended unexpectedly (cancelled or crashed).')
+                    break
+                time.sleep(0.05)
+            if self._registration_process is not None:
+                try:
+                    p.join(timeout=1.0)
+                except Exception:
+                    pass
+                self._registration_process = None
+            if result_received is None:
+                if self.registration_cancelled:
+                    pass  # _finish_registration_cancelled already called from _cancel_registration
+                else:
+                    self.root.after(0, self._fingerprint_registration_error, "Registration process ended unexpectedly.")
+                return
+            status, value = result_received
+            if status == 'error':
+                self.root.after(0, self._fingerprint_registration_error, value)
+                return
+            template_b64 = value
+            self.root.after(0, self._update_registration_status, "📡 Sending fingerprint data to server...")
+            passport_number = self.current_user_data.get('passport_number')
+            api_data = {"passport_number": passport_number, "template": template_b64}
+            response = requests.post(
+                self.fingerprint_api_url,
+                json=api_data,
+                headers={"Content-Type": "application/json"},
+                timeout=10
+            )
+            print(f"API Response Status: {response.status_code}")
+            print(f"API Response Text: {response.text}")
+            if response.status_code in [200, 201]:
+                try:
+                    result = response.json()
+                    if result.get('success', False):
+                        self.root.after(0, self._fingerprint_registration_success)
+                    else:
+                        self.root.after(0, self._fingerprint_registration_error, result.get('message', 'API registration failed'))
+                except json.JSONDecodeError:
+                    self.root.after(0, self._fingerprint_registration_error, "Invalid JSON response from API")
+            else:
+                self.root.after(0, self._fingerprint_registration_error, f"API Error: {response.status_code} - {response.text}")
+        except Exception as e:
+            self.root.after(0, self._fingerprint_registration_error, str(e))
+        finally:
+            self._registration_process = None
+    
+    def _update_registration_status(self, message):
+        """Update registration status in GUI"""
+        self.register_status_label.configure(text=message, style='Info.TLabel')
+            
+    def _fingerprint_registration_success(self):
+        """Handle successful fingerprint registration"""
+        self.cancel_register_btn.pack_forget()
+        self.register_status_label.configure(text="Fingerprint registered successfully!", style='Success.TLabel')
+        self.register_fp_btn.configure(state='normal')
+        messagebox.showinfo("Success", "Fingerprint has been registered successfully!")
+
+    def _fingerprint_registration_error(self, error_message):
+        """Handle fingerprint registration error"""
+        self.cancel_register_btn.pack_forget()
+        self.register_status_label.configure(text=f"Registration failed: {error_message}", style='Error.TLabel')
+        self.register_fp_btn.configure(state='normal')
+        messagebox.showerror("Error", f"Fingerprint registration failed: {error_message}")
+        
+    def match_fingerprint(self):
+        """Match fingerprint with stored template"""
+        if not self.current_match_user_data:
+            messagebox.showerror("Error", "Please search for a passport first")
+            return
+            
+        self.match_cancelled = False
+        self.match_btn.configure(state='disabled')
+        self.cancel_match_btn.pack(side='left')
+        self.match_result_label.configure(text="Matching fingerprint... Please place finger on scanner.", 
+                                        style='Info.TLabel')
+        
+        # Run matching in separate thread
+        thread = threading.Thread(target=self._match_fingerprint_thread)
+        thread.daemon = True
+        thread.start()
+        
+    def _match_fingerprint_thread(self):
+        """Match fingerprint in separate thread"""
+        try:
+            if not self.current_match_user_data:
+                self.root.after(0, self._handle_match_error, "No user data available")
+                return
+            
+            # Get stored template from API
+            passport_number = self.current_match_user_data.get('passport_number')
+            if not passport_number:
+                self.root.after(0, self._handle_match_error, "No passport number available")
+                return
+            
+            # Update GUI: Getting stored template
+            self.root.after(0, self._update_match_status, "📡 Retrieving stored fingerprint template...")
+            
+            # Get stored template from fingerprint lookup API
+            lookup_response = requests.get(f"{self.fingerprint_lookup_url}/{passport_number}", timeout=10)
+            print(f"[MATCH TAB] Fingerprint lookup URL: {lookup_response.url}")
+
+            print(f"[MATCH TAB] Fingerprint lookup response: {lookup_response.status_code}")
+            print(f"[MATCH TAB] Fingerprint lookup response headers: {dict(lookup_response.headers)}")
+            print(f"[MATCH TAB] Fingerprint lookup response text: {lookup_response.text}")
+            
+            if lookup_response.status_code != 200:
+                self.root.after(0, self._handle_match_error, f"Failed to retrieve stored template: {lookup_response.status_code}")
+                return
+            
+            lookup_data = lookup_response.json()
+            if not lookup_data.get('success'):
+                self.root.after(0, self._handle_match_error, lookup_data.get('message', 'Failed to retrieve template'))
+                return
+            
+            stored_template_b64 = lookup_data.get('data', {}).get('template')
+            if not stored_template_b64:
+                self.root.after(0, self._handle_match_error, "No template found in API response")
+                return
+            
+            # Run device capture and match in a separate process so handle is released when done
+            progress_queue = multiprocessing.Queue()
+            result_queue = multiprocessing.Queue()
+            p = multiprocessing.Process(target=_match_worker_process, args=(progress_queue, result_queue, stored_template_b64))
+            self._match_process = p
+            p.start()
+            result_received = None
+            while True:
+                if self.match_cancelled:
+                    break
+                try:
+                    msg = progress_queue.get(timeout=0.3)
+                    self.root.after(0, self._update_match_status, msg)
+                except multiprocessing.queues.Empty:
+                    pass
+                try:
+                    result_received = result_queue.get_nowait()
+                    break
+                except multiprocessing.queues.Empty:
+                    pass
+                if not p.is_alive():
+                    if result_received is None:
+                        result_received = ('error', 'Match process ended unexpectedly.')
+                    break
+                time.sleep(0.05)
+            if self._match_process is not None:
+                try:
+                    p.join(timeout=1.0)
+                except Exception:
+                    pass
+                self._match_process = None
+            if result_received is None:
+                if self.match_cancelled:
+                    pass  # _finish_match_cancelled already called from _cancel_match
+                else:
+                    self.root.after(0, self._handle_match_error, "Match process ended without result.")
+                return
+            status, value = result_received
+            if status == 'error':
+                self.root.after(0, self._handle_match_error, value)
+                return
+            self.root.after(0, self._handle_match_result, value)
+            
+        except Exception as e:
+            self.root.after(0, self._handle_match_error, str(e))
+
+    def _cancel_match(self):
+        """Terminate the match process and reset UI."""
+        self.match_cancelled = True
+        self.match_result_label.configure(text="Cancelling...", style='Info.TLabel')
+        if getattr(self, '_match_process', None) is not None:
+            try:
+                self._match_process.terminate()
+                self._match_process.join(timeout=2.0)
+                if self._match_process.is_alive():
+                    self._match_process.kill()
+            except Exception:
+                pass
+            self._match_process = None
+        self.root.after(0, self._finish_match_cancelled)
+
+    def _finish_match_cancelled(self):
+        """Reset Match tab UI after cancel."""
+        self.cancel_match_btn.pack_forget()
+        self.match_btn.configure(state='normal')
+        self.match_result_label.configure(text="Match cancelled.", style='Info.TLabel')
+        messagebox.showinfo("Cancelled", "Fingerprint match was cancelled.")
+
+    def _update_match_status(self, message):
+        """Update match status in GUI"""
+        self.match_result_label.configure(text=message, style='Info.TLabel')
+            
+    def _handle_match_result(self, result):
+        """Handle fingerprint match result"""
+        self.cancel_match_btn.pack_forget()
+        self.match_btn.configure(state='normal')
+        if result:
+            self.match_result_label.configure(text="✅ Match successful", 
+                                            style='MatchSuccess.TLabel')
+            messagebox.showinfo("Match Success", "Fingerprint matched successfully")
+        else:
+            self.match_result_label.configure(text="❌ Does not match", 
+                                            style='MatchNoMatch.TLabel')
+            messagebox.showwarning("No Match", "Fingerprint does not match")
+            
+    def _handle_match_error(self, error_message):
+        """Handle fingerprint match error"""
+        self.cancel_match_btn.pack_forget()
+        self.match_btn.configure(state='normal')
+        self.match_result_label.configure(text=f"Error: {error_message}", style='Error.TLabel')
+        messagebox.showerror("Error", f"Matching failed: {error_message}")
+    
+    def load_settings(self):
+        """Load settings from JSON file"""
+        settings_file = settings_path()
+        default_settings = {
+            "server_url": "http://rtmsbd.com",
+            "last_updated": datetime.now().isoformat()
+        }
+        
+        try:
+            if os.path.exists(settings_file):
+                with open(settings_file, 'r') as f:
+                    settings = json.load(f)
+                    return settings
+            else:
+                # Create default settings file
+                with open(settings_file, 'w') as f:
+                    json.dump(default_settings, f, indent=2)
+                return default_settings
+        except Exception as e:
+            print(f"Error loading settings: {e}")
+            return default_settings
+    
+    def save_settings_to_file(self, settings):
+        """Save settings to JSON file"""
+        settings_file = settings_path()
+        try:
+            settings["last_updated"] = datetime.now().isoformat()
+            with open(settings_file, 'w') as f:
+                json.dump(settings, f, indent=2)
+            return True
+        except Exception as e:
+            print(f"Error saving settings: {e}")
+            return False
+    
+    def save_settings_ui(self):
+        """Save settings from UI"""
+        new_url = self.server_url_entry.get().strip()
+        
+        # Validate URL
+        if not new_url:
+            messagebox.showerror("Error", "Server URL cannot be empty")
+            return
+        
+        if not (new_url.startswith('http://') or new_url.startswith('https://')):
+            messagebox.showerror("Error", "Server URL must start with http:// or https://")
+            return
+        
+        # Update settings
+        self.settings["server_url"] = new_url
+        
+        # Save to file
+        if self.save_settings_to_file(self.settings):
+            # Update API URLs
+            self.api_base_url = new_url + "/api/v1/service-request/passport/"
+            self.fingerprint_api_url = new_url + "/api/v1/fingerprint/register"
+            self.fingerprint_lookup_url = new_url + "/api/v1/finger/passport"
+            self.fingerprint_identify_url = new_url + "/api/v1/finger/identify"
+            
+            self.settings_status_label.configure(text="✅ Settings saved successfully!", style='Success.TLabel')
+            messagebox.showinfo("Success", "Settings have been saved successfully!")
+        else:
+            self.settings_status_label.configure(text="❌ Failed to save settings", style='Error.TLabel')
+            messagebox.showerror("Error", "Failed to save settings to file")
+    
+    def test_connection(self):
+        """Test connection to the server"""
+        test_url = self.server_url_entry.get().strip()
+        
+        if not test_url:
+            messagebox.showerror("Error", "Please enter a server URL")
+            return
+        
+        self.test_btn.configure(state='disabled')
+        self.settings_status_label.configure(text="Testing connection...", style='Info.TLabel')
+        
+        # Run test in separate thread
+        thread = threading.Thread(target=self._test_connection_thread, args=(test_url,))
+        thread.daemon = True
+        thread.start()
+    
+    def _test_connection_thread(self, test_url):
+        """Test connection in separate thread"""
+        try:
+            # Test with a simple GET request to the base URL
+            response = requests.get(test_url, timeout=5)
+            self.root.after(0, self._handle_test_result, True, f"Connection successful! Status: {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            self.root.after(0, self._handle_test_result, False, str(e))
+    
+    def _handle_test_result(self, success, message):
+        """Handle test connection result"""
+        self.test_btn.configure(state='normal')
+        if success:
+            self.settings_status_label.configure(text=f"✅ {message}", style='Success.TLabel')
+        else:
+            self.settings_status_label.configure(text=f"❌ Connection failed: {message}", style='Error.TLabel')
+    
+    def reset_to_default(self):
+        """Reset server URL to default"""
+        default_url = "http://rtmsbd.com"
+        self.server_url_entry.delete(0, tk.END)
+        self.server_url_entry.insert(0, default_url)
+        self.settings_status_label.configure(text="Reset to default URL", style='Info.TLabel')
+    
+    def refresh_db_info(self):
+        """Refresh database information"""
+        try:
+            fingerprints = list_fingers()
+            count = len(fingerprints) if fingerprints else 0
+            
+            db_info = f"Total fingerprints stored: {count}\n"
+            if count > 0:
+                db_info += f"Fingerprint IDs: {', '.join([str(fp[0]) for fp in fingerprints[:5]])}"
+                if count > 5:
+                    db_info += f" and {count - 5} more..."
+            
+            self.db_info_label.configure(text=db_info)
+        except Exception as e:
+            self.db_info_label.configure(text=f"Error reading database: {e}")
+            
+    def match_search_passport(self):
+        """Search for passport information via API"""
+        passport_number = self.match_passport_entry.get().strip()
+        if not passport_number:
+            messagebox.showerror("Error", "Please enter a passport number")
+            return
+            
+        # Disable search button and show loading
+        self.match_search_btn.configure(state='disabled')
+        self.match_loading_label.configure(text="Searching...", style='Info.TLabel')
+        
+        # Run API call in separate thread to prevent UI freezing
+        thread = threading.Thread(target=self._match_api_search_thread, args=(passport_number,))
+        thread.daemon = True
+        thread.start()
+        
+    def _match_api_search_thread(self, passport_number):
+        """API search in separate thread"""
+        try:
+            url = f"{self.api_base_url}{passport_number}"
+            print(f"[MATCH TAB] Searching passport: {passport_number}")
+            print(f"[MATCH TAB] API URL: {url}")
+            print(f"[MATCH TAB] Base URL: {self.api_base_url}")
+            print(f"[MATCH TAB] Fingerprint lookup URL: {self.fingerprint_lookup_url}")
+            
+            response = requests.get(url, timeout=10)
+            print(f"[MATCH TAB] Response status: {response.status_code}")
+            print(f"[MATCH TAB] Response headers: {dict(response.headers)}")
+            print(f"[MATCH TAB] Response text: {response.text}")
+            
+            # Schedule UI update in main thread
+            self.root.after(0, self._handle_match_api_response, response, passport_number)
+            
+        except requests.exceptions.RequestException as e:
+            print(f"[MATCH TAB] Request exception: {str(e)}")
+            self.root.after(0, self._handle_match_api_error, str(e))
+            
+    def _handle_match_api_response(self, response, passport_number):
+        """Handle API response in main thread"""
+        try:
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('success'):
+                    self.current_match_user_data = data.get('data')
+                    self._display_match_user_details(self.current_match_user_data)
+                    self.match_loading_label.configure(text="User found successfully!", style='Success.TLabel')
+                else:
+                    self._handle_match_api_error(data.get('message', 'Unknown error'))
+            else:
+                self._handle_match_api_error(f"HTTP {response.status_code}: {response.text}")
+                
+        except json.JSONDecodeError:
+            self._handle_match_api_error("Invalid response format")
+        except Exception as e:
+            self._handle_match_api_error(str(e))
+        finally:
+            self.match_search_btn.configure(state='normal')
+            
+    def _handle_match_api_error(self, error_message):
+        """Handle API errors"""
+        self.match_loading_label.configure(text=f"Error: {error_message}", style='Error.TLabel')
+        self.match_search_btn.configure(state='normal')
+        self.match_details_frame.pack_forget()
+        self.current_match_user_data = None
+        
+    def _display_match_user_details(self, user_data):
+        """Display user details with left (details) and right (photo/emoji) layout"""
+        for widget in self.match_details_frame.winfo_children():
+            widget.destroy()
+        self.match_details_frame.pack(fill='x', pady=(0, 20))
+        details_container, _ = self._build_details_with_photo(self.match_details_frame, user_data, is_match_tab=True)
+        self._fill_detail_sections(details_container, user_data)
+
+    def auto_search(self):
+        """Capture fingerprint and identify user via API (no passport number required)."""
+        self.auto_search_cancelled = False
+        self.auto_search_btn.configure(state='disabled')
+        self.cancel_auto_search_btn.pack(side='left')
+        self.auto_search_status_label.configure(
+            text="Scanning fingerprint... Please place finger on scanner.",
+            style='Info.TLabel',
+        )
+        self.auto_search_details_frame.pack_forget()
+        self.current_auto_search_user_data = None
+        thread = threading.Thread(target=self._auto_search_thread)
+        thread.daemon = True
+        thread.start()
+
+    def _cancel_auto_search(self):
+        """Terminate auto search capture process and reset UI."""
+        self.auto_search_cancelled = True
+        self.auto_search_status_label.configure(text="Cancelling...", style='Info.TLabel')
+        if getattr(self, '_auto_search_process', None) is not None:
+            try:
+                self._auto_search_process.terminate()
+                self._auto_search_process.join(timeout=2.0)
+                if self._auto_search_process.is_alive():
+                    self._auto_search_process.kill()
+            except Exception:
+                pass
+            self._auto_search_process = None
+        self.root.after(0, self._finish_auto_search_cancelled)
+
+    def _finish_auto_search_cancelled(self):
+        self.cancel_auto_search_btn.pack_forget()
+        self.auto_search_btn.configure(state='normal')
+        self.auto_search_status_label.configure(text="Auto search cancelled.", style='Info.TLabel')
+
+    def _update_auto_search_status(self, message):
+        self.auto_search_status_label.configure(text=message, style='Info.TLabel')
+
+    def _auto_search_thread(self):
+        """Capture fingerprint, POST to identify API, then load passport details."""
+        self._auto_search_process = None
+        try:
+            progress_queue = multiprocessing.Queue()
+            result_queue = multiprocessing.Queue()
+            p = multiprocessing.Process(
+                target=_registration_worker_process,
+                args=(progress_queue, result_queue),
+            )
+            self._auto_search_process = p
+            p.start()
+            result_received = None
+            while True:
+                if self.auto_search_cancelled:
+                    break
+                try:
+                    msg = progress_queue.get(timeout=0.3)
+                    self.root.after(0, self._update_auto_search_status, msg)
+                except multiprocessing.queues.Empty:
+                    pass
+                try:
+                    result_received = result_queue.get_nowait()
+                    break
+                except multiprocessing.queues.Empty:
+                    pass
+                if not p.is_alive():
+                    if result_received is None:
+                        result_received = ('error', 'Capture process ended unexpectedly.')
+                    break
+                time.sleep(0.05)
+            if self._auto_search_process is not None:
+                try:
+                    p.join(timeout=1.0)
+                except Exception:
+                    pass
+                self._auto_search_process = None
+            if self.auto_search_cancelled:
+                return
+            if result_received is None:
+                self.root.after(0, self._handle_auto_search_error, "Capture process ended without result.")
+                return
+            status, value = result_received
+            if status == 'error':
+                self.root.after(0, self._handle_auto_search_error, value)
+                return
+
+            template_b64 = value
+            self.root.after(0, self._update_auto_search_status, "📡 Searching database for matching fingerprint...")
+            headers = {"Content-Type": "application/json"}
+            if self.auth_token:
+                headers["Authorization"] = f"Bearer {self.auth_token}"
+            response = requests.post(
+                self.fingerprint_identify_url,
+                json={"template": template_b64},
+                headers=headers,
+                timeout=30,
+            )
+            if response.status_code not in (200, 201):
+                self.root.after(
+                    0,
+                    self._handle_auto_search_error,
+                    f"Identify API error: {response.status_code} - {response.text}",
+                )
+                return
+            try:
+                result = response.json()
+            except json.JSONDecodeError:
+                self.root.after(0, self._handle_auto_search_error, "Invalid JSON response from identify API")
+                return
+            if not result.get('success'):
+                self.root.after(
+                    0,
+                    self._handle_auto_search_error,
+                    result.get('message', 'No matching fingerprint found'),
+                )
+                return
+
+            data = result.get('data') or {}
+            user_data = data if isinstance(data, dict) and data.get('passport_number') and data.get('full_name') else None
+            passport_number = None
+            if user_data:
+                passport_number = user_data.get('passport_number')
+            elif isinstance(data, dict):
+                passport_number = data.get('passport_number')
+            else:
+                passport_number = data if isinstance(data, str) else None
+
+            if user_data:
+                self.root.after(0, self._handle_auto_search_success, user_data)
+                return
+            if not passport_number:
+                self.root.after(
+                    0,
+                    self._handle_auto_search_error,
+                    "Identify API succeeded but no passport number was returned.",
+                )
+                return
+
+            self.root.after(0, self._update_auto_search_status, f"📡 Loading details for passport {passport_number}...")
+            passport_response = requests.get(f"{self.api_base_url}{passport_number}", timeout=10)
+            if passport_response.status_code != 200:
+                self.root.after(
+                    0,
+                    self._handle_auto_search_error,
+                    f"Failed to load passport details: {passport_response.status_code}",
+                )
+                return
+            passport_data = passport_response.json()
+            if not passport_data.get('success'):
+                self.root.after(
+                    0,
+                    self._handle_auto_search_error,
+                    passport_data.get('message', 'Failed to load passport details'),
+                )
+                return
+            self.root.after(0, self._handle_auto_search_success, passport_data.get('data'))
+        except Exception as e:
+            self.root.after(0, self._handle_auto_search_error, str(e))
+        finally:
+            self._auto_search_process = None
+
+    def _handle_auto_search_success(self, user_data):
+        self.cancel_auto_search_btn.pack_forget()
+        self.auto_search_btn.configure(state='normal')
+        if not user_data:
+            self._handle_auto_search_error("No user data returned")
+            return
+        self.current_auto_search_user_data = user_data
+        self._display_auto_search_user_details(user_data)
+        name = user_data.get('full_name') or user_data.get('passport_number') or 'User'
+        self.auto_search_status_label.configure(
+            text=f"✅ Match found: {name}",
+            style='Success.TLabel',
+        )
+        messagebox.showinfo("Auto Search", f"User identified: {name}")
+
+    def _handle_auto_search_error(self, error_message):
+        self.cancel_auto_search_btn.pack_forget()
+        self.auto_search_btn.configure(state='normal')
+        self.auto_search_status_label.configure(text=f"Error: {error_message}", style='Error.TLabel')
+        self.auto_search_details_frame.pack_forget()
+        self.current_auto_search_user_data = None
+        messagebox.showerror("Auto Search", str(error_message))
+
+    def _display_auto_search_user_details(self, user_data):
+        for widget in self.auto_search_details_frame.winfo_children():
+            widget.destroy()
+        self.auto_search_details_frame.pack(fill='both', expand=True, pady=(0, 0))
+        details_container, _ = self._build_details_with_photo(
+            self.auto_search_details_frame, user_data, is_match_tab=True
+        )
+        self._fill_detail_sections(details_container, user_data)
+
+
+def run_app():
+    root = tk.Tk()
+    root.geometry("420x320")
+    root.configure(bg="#f0f0f0")
+
+    def show_login():
+        for w in root.winfo_children():
+            w.destroy()
+        root.geometry("420x320")
+        LoginScreen(root, on_success=on_login_success)
+
+    def on_login_success(token, user_info):
+        for w in root.winfo_children():
+            w.destroy()
+        root.geometry("900x700")
+        FingerprintApp(root, auth_token=token, user_info=user_info, on_logout=show_login)
+
+    show_login()
+    root.mainloop()
