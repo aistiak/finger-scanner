@@ -215,11 +215,12 @@ class FingerprintApp:
         # Load settings
         self.settings = self.load_settings()
         
-        # Create tabs: Register for super_admin, beman, frontdesk; Match for non-frontdesk; Settings for everyone
+        # Create tabs: Register/Match by role; Auto Search + Settings for everyone
         if self.can_register:
             self.create_register_tab()
         if self.can_match:
             self.create_match_tab()
+        self.create_auto_search_tab()
         self.create_settings_tab()
         
         # API URLs from settings
@@ -227,6 +228,7 @@ class FingerprintApp:
         self.api_base_url = server_url + "/api/v1/service-request/passport/"
         self.fingerprint_api_url = server_url + "/api/v1/fingerprint/register"
         self.fingerprint_lookup_url = server_url + "/api/v1/finger/passport"
+        self.fingerprint_identify_url = server_url + "/api/v1/finger/identify"
         self.login_url_base = server_url.rstrip('/')  # for logout
 
     def _logout(self):
@@ -348,6 +350,37 @@ class FingerprintApp:
         self.match_details_frame.pack(fill='both', expand=True, pady=(0, 0))
         self.match_details_frame.pack_forget()
         
+    def create_auto_search_tab(self):
+        """Create auto search tab (fingerprint first, then identify via API). Visible to all roles."""
+        auto_frame = ttk.Frame(self.notebook)
+        self.notebook.add(auto_frame, text="Auto Search")
+        
+        main_container = ttk.Frame(auto_frame)
+        main_container.pack(fill='both', expand=True, padx=20, pady=20)
+        
+        title_label = ttk.Label(main_container, text="Fingerprint Auto Search", style='Title.TLabel')
+        title_label.pack(pady=(0, 10))
+        
+        top_frame = ttk.LabelFrame(main_container, text="Scan & Identify", padding=10)
+        top_frame.pack(fill='x', pady=(0, 10))
+        row1 = ttk.Frame(top_frame)
+        row1.pack(fill='x')
+        self.auto_search_btn = ttk.Button(row1, text="Auto Search", command=self.auto_search)
+        self.auto_search_btn.pack(side='left', padx=(0, 8))
+        self.cancel_auto_search_btn = ttk.Button(row1, text="Cancel", command=self._cancel_auto_search)
+        self.cancel_auto_search_btn.pack(side='left')
+        self.cancel_auto_search_btn.pack_forget()
+        self.auto_search_status_label = ttk.Label(top_frame, text="Place finger on scanner to search by fingerprint.", style='Info.TLabel')
+        self.auto_search_status_label.pack(anchor='w', pady=(8, 0))
+        
+        self.auto_search_cancelled = False
+        self._auto_search_process = None
+        self.current_auto_search_user_data = None
+        
+        self.auto_search_details_frame = ttk.LabelFrame(main_container, text="User Details", padding=15)
+        self.auto_search_details_frame.pack(fill='both', expand=True, pady=(0, 0))
+        self.auto_search_details_frame.pack_forget()
+        
     def create_settings_tab(self):
         """Create the settings tab"""
         settings_frame = ttk.Frame(self.notebook)
@@ -411,6 +444,7 @@ This application allows you to:
 • Search passport information via API
 • Register fingerprints linked to passport data
 • Match fingerprints against stored templates
+• Auto search by fingerprint (no passport number required)
 • Configure server settings
 
 Settings are automatically saved to your local machine.
@@ -1072,6 +1106,7 @@ Settings are automatically saved to your local machine.
             self.api_base_url = new_url + "/api/v1/service-request/passport/"
             self.fingerprint_api_url = new_url + "/api/v1/fingerprint/register"
             self.fingerprint_lookup_url = new_url + "/api/v1/finger/passport"
+            self.fingerprint_identify_url = new_url + "/api/v1/finger/identify"
             
             self.settings_status_label.configure(text="✅ Settings saved successfully!", style='Success.TLabel')
             messagebox.showinfo("Success", "Settings have been saved successfully!")
@@ -1206,6 +1241,198 @@ Settings are automatically saved to your local machine.
             widget.destroy()
         self.match_details_frame.pack(fill='x', pady=(0, 20))
         details_container, _ = self._build_details_with_photo(self.match_details_frame, user_data, is_match_tab=True)
+        self._fill_detail_sections(details_container, user_data)
+
+    def auto_search(self):
+        """Capture fingerprint and identify user via API (no passport number required)."""
+        self.auto_search_cancelled = False
+        self.auto_search_btn.configure(state='disabled')
+        self.cancel_auto_search_btn.pack(side='left')
+        self.auto_search_status_label.configure(
+            text="Scanning fingerprint... Please place finger on scanner.",
+            style='Info.TLabel',
+        )
+        self.auto_search_details_frame.pack_forget()
+        self.current_auto_search_user_data = None
+        thread = threading.Thread(target=self._auto_search_thread)
+        thread.daemon = True
+        thread.start()
+
+    def _cancel_auto_search(self):
+        """Terminate auto search capture process and reset UI."""
+        self.auto_search_cancelled = True
+        self.auto_search_status_label.configure(text="Cancelling...", style='Info.TLabel')
+        if getattr(self, '_auto_search_process', None) is not None:
+            try:
+                self._auto_search_process.terminate()
+                self._auto_search_process.join(timeout=2.0)
+                if self._auto_search_process.is_alive():
+                    self._auto_search_process.kill()
+            except Exception:
+                pass
+            self._auto_search_process = None
+        self.root.after(0, self._finish_auto_search_cancelled)
+
+    def _finish_auto_search_cancelled(self):
+        self.cancel_auto_search_btn.pack_forget()
+        self.auto_search_btn.configure(state='normal')
+        self.auto_search_status_label.configure(text="Auto search cancelled.", style='Info.TLabel')
+
+    def _update_auto_search_status(self, message):
+        self.auto_search_status_label.configure(text=message, style='Info.TLabel')
+
+    def _auto_search_thread(self):
+        """Capture fingerprint, POST to identify API, then load passport details."""
+        self._auto_search_process = None
+        try:
+            progress_queue = multiprocessing.Queue()
+            result_queue = multiprocessing.Queue()
+            p = multiprocessing.Process(
+                target=_registration_worker_process,
+                args=(progress_queue, result_queue),
+            )
+            self._auto_search_process = p
+            p.start()
+            result_received = None
+            while True:
+                if self.auto_search_cancelled:
+                    break
+                try:
+                    msg = progress_queue.get(timeout=0.3)
+                    self.root.after(0, self._update_auto_search_status, msg)
+                except multiprocessing.queues.Empty:
+                    pass
+                try:
+                    result_received = result_queue.get_nowait()
+                    break
+                except multiprocessing.queues.Empty:
+                    pass
+                if not p.is_alive():
+                    if result_received is None:
+                        result_received = ('error', 'Capture process ended unexpectedly.')
+                    break
+                time.sleep(0.05)
+            if self._auto_search_process is not None:
+                try:
+                    p.join(timeout=1.0)
+                except Exception:
+                    pass
+                self._auto_search_process = None
+            if self.auto_search_cancelled:
+                return
+            if result_received is None:
+                self.root.after(0, self._handle_auto_search_error, "Capture process ended without result.")
+                return
+            status, value = result_received
+            if status == 'error':
+                self.root.after(0, self._handle_auto_search_error, value)
+                return
+
+            template_b64 = value
+            self.root.after(0, self._update_auto_search_status, "📡 Searching database for matching fingerprint...")
+            headers = {"Content-Type": "application/json"}
+            if self.auth_token:
+                headers["Authorization"] = f"Bearer {self.auth_token}"
+            response = requests.post(
+                self.fingerprint_identify_url,
+                json={"template": template_b64},
+                headers=headers,
+                timeout=30,
+            )
+            if response.status_code not in (200, 201):
+                self.root.after(
+                    0,
+                    self._handle_auto_search_error,
+                    f"Identify API error: {response.status_code} - {response.text}",
+                )
+                return
+            try:
+                result = response.json()
+            except json.JSONDecodeError:
+                self.root.after(0, self._handle_auto_search_error, "Invalid JSON response from identify API")
+                return
+            if not result.get('success'):
+                self.root.after(
+                    0,
+                    self._handle_auto_search_error,
+                    result.get('message', 'No matching fingerprint found'),
+                )
+                return
+
+            data = result.get('data') or {}
+            user_data = data if isinstance(data, dict) and data.get('passport_number') and data.get('full_name') else None
+            passport_number = None
+            if user_data:
+                passport_number = user_data.get('passport_number')
+            elif isinstance(data, dict):
+                passport_number = data.get('passport_number')
+            else:
+                passport_number = data if isinstance(data, str) else None
+
+            if user_data:
+                self.root.after(0, self._handle_auto_search_success, user_data)
+                return
+            if not passport_number:
+                self.root.after(
+                    0,
+                    self._handle_auto_search_error,
+                    "Identify API succeeded but no passport number was returned.",
+                )
+                return
+
+            self.root.after(0, self._update_auto_search_status, f"📡 Loading details for passport {passport_number}...")
+            passport_response = requests.get(f"{self.api_base_url}{passport_number}", timeout=10)
+            if passport_response.status_code != 200:
+                self.root.after(
+                    0,
+                    self._handle_auto_search_error,
+                    f"Failed to load passport details: {passport_response.status_code}",
+                )
+                return
+            passport_data = passport_response.json()
+            if not passport_data.get('success'):
+                self.root.after(
+                    0,
+                    self._handle_auto_search_error,
+                    passport_data.get('message', 'Failed to load passport details'),
+                )
+                return
+            self.root.after(0, self._handle_auto_search_success, passport_data.get('data'))
+        except Exception as e:
+            self.root.after(0, self._handle_auto_search_error, str(e))
+        finally:
+            self._auto_search_process = None
+
+    def _handle_auto_search_success(self, user_data):
+        self.cancel_auto_search_btn.pack_forget()
+        self.auto_search_btn.configure(state='normal')
+        if not user_data:
+            self._handle_auto_search_error("No user data returned")
+            return
+        self.current_auto_search_user_data = user_data
+        self._display_auto_search_user_details(user_data)
+        name = user_data.get('full_name') or user_data.get('passport_number') or 'User'
+        self.auto_search_status_label.configure(
+            text=f"✅ Match found: {name}",
+            style='Success.TLabel',
+        )
+        messagebox.showinfo("Auto Search", f"User identified: {name}")
+
+    def _handle_auto_search_error(self, error_message):
+        self.cancel_auto_search_btn.pack_forget()
+        self.auto_search_btn.configure(state='normal')
+        self.auto_search_status_label.configure(text=f"Error: {error_message}", style='Error.TLabel')
+        self.auto_search_details_frame.pack_forget()
+        self.current_auto_search_user_data = None
+        messagebox.showerror("Auto Search", str(error_message))
+
+    def _display_auto_search_user_details(self, user_data):
+        for widget in self.auto_search_details_frame.winfo_children():
+            widget.destroy()
+        self.auto_search_details_frame.pack(fill='both', expand=True, pady=(0, 0))
+        details_container, _ = self._build_details_with_photo(
+            self.auto_search_details_frame, user_data, is_match_tab=True
+        )
         self._fill_detail_sections(details_container, user_data)
 
 def main():
