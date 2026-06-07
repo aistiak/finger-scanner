@@ -5,3 +5,4 @@ build/
 dist/
 *.spec.bak
 fingerprints-1.db
+logs.txt

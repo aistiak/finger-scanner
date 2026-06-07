@@ -12,6 +12,7 @@ import time
 import multiprocessing
 import sys
 import os
+import traceback
 
 try:
     from PIL import Image, ImageTk
@@ -33,6 +34,193 @@ def settings_path():
 
 def db_path():
     return os.path.join(app_dir(), "fingerprints-1.db")
+
+
+def logs_path():
+    return os.path.join(app_dir(), "logs.txt")
+
+
+_log_lock = threading.Lock()
+
+
+def _write_log(level, message):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] [{level}] {message}\n"
+    try:
+        with _log_lock:
+            with open(logs_path(), "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception:
+        pass
+
+
+def log_info(message):
+    _write_log("INFO", str(message))
+
+
+def log_error(message):
+    _write_log("ERROR", str(message))
+
+
+def log_exception(message, exc=None):
+    if exc is not None:
+        detail = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        ).strip()
+        _write_log("ERROR", f"{message}\n{detail}")
+        return
+    exc_info = sys.exc_info()
+    if exc_info[0] is not None:
+        detail = "".join(traceback.format_exception(*exc_info)).strip()
+        _write_log("ERROR", f"{message}\n{detail}")
+    else:
+        _write_log("ERROR", str(message))
+
+
+def install_global_exception_logger():
+    def _hook(exc_type, exc_value, exc_tb):
+        detail = "".join(traceback.format_exception(exc_type, exc_value, exc_tb)).strip()
+        _write_log("ERROR", f"Uncaught exception\n{detail}")
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _hook
+
+
+def normalize_server_url(url):
+    return (url or "https://rtmsbd.com").strip().rstrip("/")
+
+
+def api_request_headers(auth_token=None):
+    """Headers for Laravel API calls. Accept: application/json avoids HTML error pages."""
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+    return headers
+
+
+def parse_api_response(response):
+    """Return (data_dict or None, error_message). error_message set when body is not JSON."""
+    content_type = (response.headers.get("Content-Type") or "").lower()
+    text = (response.text or "").strip()
+    if not text:
+        return None, f"Empty response from server (HTTP {response.status_code})."
+    if "json" not in content_type and not (text.startswith("{") or text.startswith("[")):
+        return None, (
+            f"Server returned non-JSON (HTTP {response.status_code}). "
+            "Use https:// in Settings and ensure the API is online."
+        )
+    try:
+        return response.json(), None
+    except json.JSONDecodeError:
+        return None, (
+            f"Invalid JSON from server (HTTP {response.status_code}). "
+            "Use https:// in Settings and try again."
+        )
+
+
+def extract_api_error_message(data, response):
+    if not isinstance(data, dict):
+        return response.text or f"HTTP {response.status_code}"
+    if data.get("message"):
+        msg = str(data["message"])
+        if "Unknown column 'token'" in msg:
+            return (
+                "Server error: login token cannot be saved (missing token column in database). "
+                "Contact the RTMS administrator to fix the users table."
+            )
+        return msg
+    errors = data.get("errors")
+    if isinstance(errors, dict):
+        parts = []
+        for field, msgs in errors.items():
+            if isinstance(msgs, list):
+                parts.append(f"{field}: {', '.join(str(m) for m in msgs)}")
+            else:
+                parts.append(f"{field}: {msgs}")
+        if parts:
+            return "; ".join(parts)
+    return str(data.get("error") or response.text or f"HTTP {response.status_code}")
+
+
+def extract_login_user_info(data):
+    """Map login API success payload to app user_info (supports nested or flat shapes)."""
+    user_data = data.get("data")
+    if not isinstance(user_data, dict):
+        user_data = data.get("user") if isinstance(data.get("user"), dict) else {}
+    token = user_data.get("token") or data.get("token") or data.get("access_token")
+    return {
+        "name": user_data.get("name") or data.get("name") or "",
+        "email": user_data.get("email") or data.get("email") or "",
+        "phone_number": user_data.get("phone_number") or data.get("phone_number") or "",
+        "role": (user_data.get("role") or data.get("role") or "").strip().lower(),
+        "token": token,
+        "token_expires_at": user_data.get("token_expires_at") or data.get("token_expires_at"),
+    }
+
+
+def is_auth_ok_token_save_failed(data, response):
+    """True when password was accepted but server failed saving token to DB."""
+    if response.status_code != 500 or not isinstance(data, dict):
+        return False
+    return "Unknown column 'token'" in str(data.get("message", ""))
+
+
+def load_remembered_user():
+    try:
+        if os.path.exists(settings_path()):
+            with open(settings_path(), "r", encoding="utf-8") as f:
+                return json.load(f).get("remembered_user") or {}
+    except Exception:
+        pass
+    return {}
+
+
+def remember_user_info(user_info):
+    """Persist user details locally (token is not stored)."""
+    try:
+        settings = {}
+        if os.path.exists(settings_path()):
+            with open(settings_path(), "r", encoding="utf-8") as f:
+                settings = json.load(f)
+        settings["remembered_user"] = {
+            "name": user_info.get("name") or "",
+            "email": user_info.get("email") or "",
+            "phone_number": user_info.get("phone_number") or "",
+            "role": user_info.get("role") or "",
+        }
+        settings["last_updated"] = datetime.now().isoformat()
+        with open(settings_path(), "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+    except Exception as e:
+        log_error(f"Could not save remembered user: {e}")
+
+
+def user_info_without_token(email, remembered=None):
+    """Build session user_info when API auth succeeded but no token is available."""
+    remembered = remembered or {}
+    email = (email or "").strip()
+    if remembered.get("email", "").lower() == email.lower():
+        return {
+            "name": remembered.get("name") or email.split("@")[0],
+            "email": email,
+            "phone_number": remembered.get("phone_number") or "",
+            "role": (remembered.get("role") or "user").strip().lower(),
+            "token": None,
+            "token_expires_at": None,
+            "_login_without_token": True,
+        }
+    return {
+        "name": email.split("@")[0] if email else "User",
+        "email": email,
+        "phone_number": "",
+        "role": "user",
+        "token": None,
+        "token_expires_at": None,
+        "_login_without_token": True,
+    }
 
 
 def init_db():
@@ -86,6 +274,7 @@ def _registration_worker_process(progress_queue, result_queue):
             pass
         result_queue.put(("ok", template_b64))
     except Exception as e:
+        log_exception("Fingerprint registration capture failed", e)
         result_queue.put(("error", str(e)))
 
 
@@ -111,14 +300,120 @@ def _match_worker_process(progress_queue, result_queue, stored_template_b64):
         progress_queue.put("Processing captured fingerprint...")
         live_template, _ = zkfp2.DBMerge(*templates)
         progress_queue.put("Comparing fingerprints...")
-        match_result = zkfp2.DBMatch(stored_template, live_template)
+        match_result = _db_match_templates(zkfp2, stored_template, live_template)
         try:
             zkfp2.Terminate()
         except Exception:
             pass
         result_queue.put(("ok", match_result > 0))
     except Exception as e:
+        log_exception("Fingerprint match worker failed", e)
         result_queue.put(("error", str(e)))
+
+
+# Page size when listing templates from GET /api/v1/finger/identify
+IDENTIFY_PAGE_LIMIT = 50
+
+# ZKTeco DBMatch: real matches are typically 60–100+; low scores are noise.
+MATCH_SCORE_THRESHOLD = 60
+MATCH_SCORE_EARLY_EXIT = 85
+
+
+def _as_int(value, default=0):
+    """Convert pythonnet / SDK numeric returns (incl. IntPtr) to int safely."""
+    if value is None or value is False:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    try:
+        return value.ToInt64()
+    except Exception:
+        pass
+    return default
+
+
+def _setup_zkfp(zkfp2, progress_queue=None):
+    """Initialize SDK + in-memory DB + device (required before DBMatch)."""
+    def say(msg):
+        if progress_queue is not None:
+            progress_queue.put(msg)
+
+    say("Initializing fingerprint SDK...")
+    zkfp2.Init()
+    try:
+        zkfp2.DBInit()
+    except Exception:
+        pass
+    say("Opening device...")
+    zkfp2.OpenDevice(0)
+
+
+def _template_for_match(raw):
+    """Convert stored/live template bytes to a type pyzkfp DBMatch accepts."""
+    if raw is None:
+        return None
+    if not isinstance(raw, (bytes, bytearray, memoryview)):
+        return raw
+    data = bytes(raw)
+    try:
+        import System
+        from System import Array, Byte
+        try:
+            return Array[Byte](data)
+        except Exception:
+            return Array[Byte](list(data))
+    except Exception:
+        return data
+
+
+def _db_match_templates(zkfp2, stored, live):
+    """Compare stored vs live merged templates (same order as Match tab). Returns match score."""
+    stored_t = _template_for_match(stored)
+    live_t = _template_for_match(live)
+    if stored_t is None or live_t is None:
+        return 0
+    try:
+        return _as_int(zkfp2.DBMatch(stored_t, live_t), 0)
+    except Exception:
+        return 0
+
+
+def _sequential_match_worker_process(progress_queue, result_queue, live_template_b64, records):
+    """Compare live template against a batch; return best-scoring record on this page."""
+    zkfp2 = None
+    try:
+        from pyzkfp import ZKFP2
+        live_template = base64.b64decode(live_template_b64)
+        zkfp2 = ZKFP2()
+        _setup_zkfp(zkfp2, progress_queue)
+        total = len(records)
+        best_score = 0
+        best_record = None
+        for index, record in enumerate(records, start=1):
+            progress_queue.put(f"Comparing {index}/{total} on this page...")
+            template_b64 = record.get("template")
+            if not template_b64:
+                continue
+            try:
+                stored_template = base64.b64decode(template_b64)
+            except Exception:
+                continue
+            score = _db_match_templates(zkfp2, stored_template, live_template)
+            if score > best_score:
+                best_score = score
+                best_record = record
+        result_queue.put(("ok", {"record": best_record, "score": best_score}))
+    except Exception as e:
+        log_exception("Auto search sequential match worker failed", e)
+        result_queue.put(("error", str(e)))
+    finally:
+        if zkfp2 is not None:
+            try:
+                zkfp2.Terminate()
+            except Exception:
+                pass
 
 
 # Beman loophole: treat as super user (full access)
@@ -165,6 +460,9 @@ class LoginScreen:
         self.email_var = tk.StringVar()
         email_entry = ttk.Entry(self.frame, textvariable=self.email_var, width=35, font=('Arial', 11))
         email_entry.pack(fill='x', pady=(2, 12))
+        remembered = load_remembered_user()
+        if remembered.get("email"):
+            self.email_var.set(remembered["email"])
         email_entry.focus()
         # Password
         ttk.Label(self.frame, text="Password").pack(anchor='w')
@@ -191,6 +489,7 @@ class LoginScreen:
             return
         # Beman loophole: username beman + password beman = super user, no API call
         if email.lower() == BEMAN_USERNAME and password == BEMAN_PASSWORD:
+            log_info("Login: local super user (beman)")
             user_info = {
                 "name": "Beman (Super User)",
                 "email": BEMAN_USERNAME,
@@ -204,47 +503,74 @@ class LoginScreen:
             return
         self.login_btn.configure(state='disabled')
         self.status_label.configure(text="Signing in...")
+        log_info(f"Login attempt: {email}")
         thread = threading.Thread(target=self._login_thread, args=(email, password))
         thread.daemon = True
         thread.start()
 
     def _login_thread(self, email, password):
         try:
-            server_url = self.settings.get('server_url', 'http://rtmsbd.com').rstrip('/')
+            server_url = normalize_server_url(self.settings.get("server_url"))
             url = f"{server_url}/api/v1/login"
             body = {"email": email, "password": password}
-            response = requests.post(url, json=body, headers={"Content-Type": "application/json"}, timeout=15)
-            self.root.after(0, self._handle_login_response, response)
+            headers = api_request_headers()
+            response = requests.post(url, json=body, headers=headers, timeout=15)
+            data, _ = parse_api_response(response)
+            if (
+                response.status_code == 422
+                and isinstance(data, dict)
+                and data.get("errors")
+            ):
+                response = requests.post(
+                    url,
+                    data=body,
+                    headers={"Accept": "application/json"},
+                    timeout=15,
+                )
+            self.root.after(0, self._handle_login_response, response, email)
         except requests.exceptions.RequestException as e:
             self.root.after(0, self._handle_login_error, str(e))
 
-    def _handle_login_response(self, response):
+    def _handle_login_response(self, response, email):
         self.login_btn.configure(state='normal')
         try:
-            data = response.json()
-            if response.status_code == 200 and data.get('success'):
-                user_data = data.get('data') or {}
-                token = user_data.get('token')
-                user_info = {
-                    "name": user_data.get('name', ''),
-                    "email": user_data.get('email', ''),
-                    "phone_number": user_data.get('phone_number', ''),
-                    "role": (user_data.get('role') or '').strip().lower(),
-                    "token": token,
-                    "token_expires_at": user_data.get('token_expires_at'),
-                }
+            data, parse_err = parse_api_response(response)
+            if parse_err:
+                log_error(f"Login failed: {parse_err} body={response.text[:300]}")
+                self.status_label.configure(text=parse_err)
+                return
+            if response.status_code == 200 and data.get("success"):
+                user_info = extract_login_user_info(data)
+                if not user_info.get("email"):
+                    user_info["email"] = email
+                remember_user_info(user_info)
+                log_info(
+                    f"Login success: {user_info.get('email')} role={user_info.get('role')} "
+                    f"token={'yes' if user_info.get('token') else 'no'}"
+                )
                 self.status_label.configure(text="")
-                self.on_success(token, user_info)
-            else:
-                msg = data.get('message', response.text or f'HTTP {response.status_code}')
-                self.status_label.configure(text=msg)
-        except json.JSONDecodeError:
-            self.status_label.configure(text="Invalid response from server.")
+                self.on_success(user_info.get("token"), user_info)
+                return
+            if is_auth_ok_token_save_failed(data, response):
+                user_info = user_info_without_token(email, load_remembered_user())
+                remember_user_info(user_info)
+                log_info(
+                    f"Login: valid credentials for {email}, continuing without API token "
+                    f"(role={user_info.get('role')})"
+                )
+                self.status_label.configure(text="")
+                self.on_success(None, user_info)
+                return
+            msg = extract_api_error_message(data, response)
+            log_error(f"Login failed (HTTP {response.status_code}): {msg}")
+            self.status_label.configure(text=msg)
         except Exception as e:
+            log_exception("Login response handling failed", e)
             self.status_label.configure(text=str(e))
 
     def _handle_login_error(self, err):
         self.login_btn.configure(state='normal')
+        log_error(f"Login connection error: {err}")
         self.status_label.configure(text=f"Connection error: {err}")
 
 
@@ -317,12 +643,15 @@ class FingerprintApp:
         self.create_settings_tab()
         
         # API URLs from settings
-        server_url = self.settings.get('server_url', 'http://rtmsbd.com')
+        server_url = normalize_server_url(self.settings.get('server_url'))
         self.api_base_url = server_url + "/api/v1/service-request/passport/"
         self.fingerprint_api_url = server_url + "/api/v1/fingerprint/register"
         self.fingerprint_lookup_url = server_url + "/api/v1/finger/passport"
         self.fingerprint_identify_url = server_url + "/api/v1/finger/identify"
         self.login_url_base = server_url.rstrip('/')  # for logout
+        log_info(
+            f"App started: user={name_display} role={role_display} server={server_url}"
+        )
 
     def _logout(self):
         """Call logout API (if token exists) then return to login screen."""
@@ -333,7 +662,7 @@ class FingerprintApp:
             def do_logout():
                 try:
                     url = f"{self.login_url_base}/api/v1/logout"
-                    requests.post(url, json={"token": token}, headers={"Content-Type": "application/json"}, timeout=10)
+                    requests.post(url, json={"token": token}, headers=api_request_headers(), timeout=10)
                 except Exception:
                     pass
                 self.root.after(0, self._on_logout_done)
@@ -343,6 +672,7 @@ class FingerprintApp:
 
     def _on_logout_done(self):
         """Switch back to login screen (clear main app, show login)."""
+        log_info("User logged out")
         if self.on_logout:
             self.on_logout()
         
@@ -503,7 +833,7 @@ class FingerprintApp:
         self.server_url_entry.pack(fill='x', pady=(0, 10))
         
         # Load current setting
-        current_url = self.settings.get('server_url', 'http://rtmsbd.com')
+        current_url = self.settings.get('server_url', 'https://rtmsbd.com')
         self.server_url_entry.insert(0, current_url)
         
         # Buttons frame
@@ -578,6 +908,7 @@ Settings are automatically saved to your local machine.
         # Disable search button and show loading
         self.search_btn.configure(state='disabled')
         self.loading_label.configure(text="Searching...", style='Info.TLabel')
+        log_info(f"Register tab: passport search {passport_number}")
         
         # Run API call in separate thread to prevent UI freezing
         thread = threading.Thread(target=self._api_search_thread, args=(passport_number,))
@@ -588,12 +919,13 @@ Settings are automatically saved to your local machine.
         """API search in separate thread"""
         try:
             url = f"{self.api_base_url}{passport_number}"
-            response = requests.get(url, timeout=10)
+            response = requests.get(url, headers=api_request_headers(self.auth_token), timeout=10)
             
             # Schedule UI update in main thread
             self.root.after(0, self._handle_api_response, response, passport_number)
             
         except requests.exceptions.RequestException as e:
+            log_exception(f"Register tab: passport search failed ({passport_number})", e)
             self.root.after(0, self._handle_api_error, str(e))
             
     def _handle_api_response(self, response, passport_number):
@@ -605,6 +937,7 @@ Settings are automatically saved to your local machine.
                     self.current_user_data = data.get('data')
                     self._display_user_details(self.current_user_data)
                     self.loading_label.configure(text="User found successfully!", style='Success.TLabel')
+                    log_info(f"Register tab: user found {passport_number}")
                     
                     # Check fingerprint status and update button accordingly
                     fingerprint_info = self.current_user_data.get('fingerprint', {})
@@ -630,6 +963,7 @@ Settings are automatically saved to your local machine.
             
     def _handle_api_error(self, error_message):
         """Handle API errors"""
+        log_error(f"Register tab: {error_message}")
         self.loading_label.configure(text=f"Error: {error_message}", style='Error.TLabel')
         self.search_btn.configure(state='normal')
         self.details_frame.pack_forget()
@@ -745,7 +1079,7 @@ Settings are automatically saved to your local machine.
             return None, emoji
         # Resolve relative paths (e.g. /storage/photos/patient_xxx.jpeg)
         if isinstance(photo_source, str) and photo_source.startswith('/') and not photo_source.startswith('//'):
-            base = (self.settings.get('server_url') or 'http://rtmsbd.com').rstrip('/')
+            base = normalize_server_url(self.settings.get('server_url'))
             photo_source = base + photo_source
         return photo_source, emoji
 
@@ -767,7 +1101,7 @@ Settings are automatically saved to your local machine.
             except Exception:
                 return None
         except Exception as e:
-            print(f"[Photo] Load failed: {e}")
+            log_error(f"Photo load failed: {e}")
             return None
         return None
 
@@ -793,7 +1127,7 @@ Settings are automatically saved to your local machine.
                 lbl.pack(expand=True)
                 return
             except Exception as e:
-                print(f"[Photo] Decode failed: {e}")
+                log_error(f"Photo decode failed: {e}")
         lbl = tk.Label(photo_inner, text=emoji, font=('Segoe UI Emoji', 120), bg='#f8f9fa', fg='#495057')
         lbl.pack(expand=True, padx=20, pady=20)
 
@@ -880,6 +1214,7 @@ Settings are automatically saved to your local machine.
         status_text = "Re-registering fingerprint..." if is_registered else "Registering fingerprint..."
         self.register_status_label.configure(text=f"{status_text} Please follow scanner instructions.",
                                            style='Info.TLabel')
+        log_info(f"Register tab: fingerprint registration started for {self.current_user_data.get('passport_number')}")
         thread = threading.Thread(target=self._register_fingerprint_thread)
         thread.daemon = True
         thread.start()
@@ -957,11 +1292,10 @@ Settings are automatically saved to your local machine.
             response = requests.post(
                 self.fingerprint_api_url,
                 json=api_data,
-                headers={"Content-Type": "application/json"},
+                headers=api_request_headers(self.auth_token),
                 timeout=10
             )
-            print(f"API Response Status: {response.status_code}")
-            print(f"API Response Text: {response.text}")
+            log_info(f"Register API response: {response.status_code} {response.text[:500]}")
             if response.status_code in [200, 201]:
                 try:
                     result = response.json()
@@ -974,6 +1308,7 @@ Settings are automatically saved to your local machine.
             else:
                 self.root.after(0, self._fingerprint_registration_error, f"API Error: {response.status_code} - {response.text}")
         except Exception as e:
+            log_exception("Register tab: registration thread failed", e)
             self.root.after(0, self._fingerprint_registration_error, str(e))
         finally:
             self._registration_process = None
@@ -984,6 +1319,7 @@ Settings are automatically saved to your local machine.
             
     def _fingerprint_registration_success(self):
         """Handle successful fingerprint registration"""
+        log_info("Register tab: fingerprint registered successfully")
         self.cancel_register_btn.pack_forget()
         self.register_status_label.configure(text="Fingerprint registered successfully!", style='Success.TLabel')
         self.register_fp_btn.configure(state='normal')
@@ -991,6 +1327,7 @@ Settings are automatically saved to your local machine.
 
     def _fingerprint_registration_error(self, error_message):
         """Handle fingerprint registration error"""
+        log_error(f"Register tab: {error_message}")
         self.cancel_register_btn.pack_forget()
         self.register_status_label.configure(text=f"Registration failed: {error_message}", style='Error.TLabel')
         self.register_fp_btn.configure(state='normal')
@@ -1008,6 +1345,7 @@ Settings are automatically saved to your local machine.
         self.match_result_label.configure(text="Matching fingerprint... Please place finger on scanner.", 
                                         style='Info.TLabel')
         
+        log_info(f"Match tab: fingerprint match started for {self.current_match_user_data.get('passport_number')}")
         # Run matching in separate thread
         thread = threading.Thread(target=self._match_fingerprint_thread)
         thread.daemon = True
@@ -1030,12 +1368,14 @@ Settings are automatically saved to your local machine.
             self.root.after(0, self._update_match_status, "📡 Retrieving stored fingerprint template...")
             
             # Get stored template from fingerprint lookup API
-            lookup_response = requests.get(f"{self.fingerprint_lookup_url}/{passport_number}", timeout=10)
-            print(f"[MATCH TAB] Fingerprint lookup URL: {lookup_response.url}")
-
-            print(f"[MATCH TAB] Fingerprint lookup response: {lookup_response.status_code}")
-            print(f"[MATCH TAB] Fingerprint lookup response headers: {dict(lookup_response.headers)}")
-            print(f"[MATCH TAB] Fingerprint lookup response text: {lookup_response.text}")
+            lookup_response = requests.get(
+                f"{self.fingerprint_lookup_url}/{passport_number}",
+                headers=api_request_headers(self.auth_token),
+                timeout=10,
+            )
+            log_info(
+                f"Match tab: template lookup {lookup_response.url} status={lookup_response.status_code}"
+            )
             
             if lookup_response.status_code != 200:
                 self.root.after(0, self._handle_match_error, f"Failed to retrieve stored template: {lookup_response.status_code}")
@@ -1095,6 +1435,7 @@ Settings are automatically saved to your local machine.
             self.root.after(0, self._handle_match_result, value)
             
         except Exception as e:
+            log_exception("Match tab: match thread failed", e)
             self.root.after(0, self._handle_match_error, str(e))
 
     def _cancel_match(self):
@@ -1125,6 +1466,7 @@ Settings are automatically saved to your local machine.
             
     def _handle_match_result(self, result):
         """Handle fingerprint match result"""
+        log_info(f"Match tab: result={'match' if result else 'no match'}")
         self.cancel_match_btn.pack_forget()
         self.match_btn.configure(state='normal')
         if result:
@@ -1138,6 +1480,7 @@ Settings are automatically saved to your local machine.
             
     def _handle_match_error(self, error_message):
         """Handle fingerprint match error"""
+        log_error(f"Match tab: {error_message}")
         self.cancel_match_btn.pack_forget()
         self.match_btn.configure(state='normal')
         self.match_result_label.configure(text=f"Error: {error_message}", style='Error.TLabel')
@@ -1147,7 +1490,7 @@ Settings are automatically saved to your local machine.
         """Load settings from JSON file"""
         settings_file = settings_path()
         default_settings = {
-            "server_url": "http://rtmsbd.com",
+            "server_url": "https://rtmsbd.com",
             "last_updated": datetime.now().isoformat()
         }
         
@@ -1162,7 +1505,7 @@ Settings are automatically saved to your local machine.
                     json.dump(default_settings, f, indent=2)
                 return default_settings
         except Exception as e:
-            print(f"Error loading settings: {e}")
+            log_exception("Error loading settings", e)
             return default_settings
     
     def save_settings_to_file(self, settings):
@@ -1174,7 +1517,7 @@ Settings are automatically saved to your local machine.
                 json.dump(settings, f, indent=2)
             return True
         except Exception as e:
-            print(f"Error saving settings: {e}")
+            log_exception("Error saving settings", e)
             return False
     
     def save_settings_ui(self):
@@ -1196,14 +1539,17 @@ Settings are automatically saved to your local machine.
         # Save to file
         if self.save_settings_to_file(self.settings):
             # Update API URLs
-            self.api_base_url = new_url + "/api/v1/service-request/passport/"
-            self.fingerprint_api_url = new_url + "/api/v1/fingerprint/register"
-            self.fingerprint_lookup_url = new_url + "/api/v1/finger/passport"
-            self.fingerprint_identify_url = new_url + "/api/v1/finger/identify"
+            base = new_url.rstrip('/')
+            self.api_base_url = base + "/api/v1/service-request/passport/"
+            self.fingerprint_api_url = base + "/api/v1/fingerprint/register"
+            self.fingerprint_lookup_url = base + "/api/v1/finger/passport"
+            self.fingerprint_identify_url = base + "/api/v1/finger/identify"
             
+            log_info(f"Settings saved: server_url={base}")
             self.settings_status_label.configure(text="✅ Settings saved successfully!", style='Success.TLabel')
             messagebox.showinfo("Success", "Settings have been saved successfully!")
         else:
+            log_error("Failed to save settings to file")
             self.settings_status_label.configure(text="❌ Failed to save settings", style='Error.TLabel')
             messagebox.showerror("Error", "Failed to save settings to file")
     
@@ -1236,13 +1582,17 @@ Settings are automatically saved to your local machine.
         """Handle test connection result"""
         self.test_btn.configure(state='normal')
         if success:
+            log_info(f"Connection test: {message}")
+        else:
+            log_error(f"Connection test failed: {message}")
+        if success:
             self.settings_status_label.configure(text=f"✅ {message}", style='Success.TLabel')
         else:
             self.settings_status_label.configure(text=f"❌ Connection failed: {message}", style='Error.TLabel')
     
     def reset_to_default(self):
         """Reset server URL to default"""
-        default_url = "http://rtmsbd.com"
+        default_url = "https://rtmsbd.com"
         self.server_url_entry.delete(0, tk.END)
         self.server_url_entry.insert(0, default_url)
         self.settings_status_label.configure(text="Reset to default URL", style='Info.TLabel')
@@ -1261,6 +1611,7 @@ Settings are automatically saved to your local machine.
             
             self.db_info_label.configure(text=db_info)
         except Exception as e:
+            log_exception("Error reading local database info", e)
             self.db_info_label.configure(text=f"Error reading database: {e}")
             
     def match_search_passport(self):
@@ -1273,6 +1624,7 @@ Settings are automatically saved to your local machine.
         # Disable search button and show loading
         self.match_search_btn.configure(state='disabled')
         self.match_loading_label.configure(text="Searching...", style='Info.TLabel')
+        log_info(f"Match tab: passport search {passport_number}")
         
         # Run API call in separate thread to prevent UI freezing
         thread = threading.Thread(target=self._match_api_search_thread, args=(passport_number,))
@@ -1283,21 +1635,14 @@ Settings are automatically saved to your local machine.
         """API search in separate thread"""
         try:
             url = f"{self.api_base_url}{passport_number}"
-            print(f"[MATCH TAB] Searching passport: {passport_number}")
-            print(f"[MATCH TAB] API URL: {url}")
-            print(f"[MATCH TAB] Base URL: {self.api_base_url}")
-            print(f"[MATCH TAB] Fingerprint lookup URL: {self.fingerprint_lookup_url}")
-            
-            response = requests.get(url, timeout=10)
-            print(f"[MATCH TAB] Response status: {response.status_code}")
-            print(f"[MATCH TAB] Response headers: {dict(response.headers)}")
-            print(f"[MATCH TAB] Response text: {response.text}")
+            response = requests.get(url, headers=api_request_headers(self.auth_token), timeout=10)
+            log_info(f"Match tab: passport API {url} status={response.status_code}")
             
             # Schedule UI update in main thread
             self.root.after(0, self._handle_match_api_response, response, passport_number)
             
         except requests.exceptions.RequestException as e:
-            print(f"[MATCH TAB] Request exception: {str(e)}")
+            log_exception(f"Match tab: passport search failed ({passport_number})", e)
             self.root.after(0, self._handle_match_api_error, str(e))
             
     def _handle_match_api_response(self, response, passport_number):
@@ -1309,6 +1654,7 @@ Settings are automatically saved to your local machine.
                     self.current_match_user_data = data.get('data')
                     self._display_match_user_details(self.current_match_user_data)
                     self.match_loading_label.configure(text="User found successfully!", style='Success.TLabel')
+                    log_info(f"Match tab: user found {passport_number}")
                 else:
                     self._handle_match_api_error(data.get('message', 'Unknown error'))
             else:
@@ -1323,6 +1669,7 @@ Settings are automatically saved to your local machine.
             
     def _handle_match_api_error(self, error_message):
         """Handle API errors"""
+        log_error(f"Match tab: {error_message}")
         self.match_loading_label.configure(text=f"Error: {error_message}", style='Error.TLabel')
         self.match_search_btn.configure(state='normal')
         self.match_details_frame.pack_forget()
@@ -1347,6 +1694,7 @@ Settings are automatically saved to your local machine.
         )
         self.auto_search_details_frame.pack_forget()
         self.current_auto_search_user_data = None
+        log_info("Auto Search: started")
         thread = threading.Thread(target=self._auto_search_thread)
         thread.daemon = True
         thread.start()
@@ -1367,6 +1715,7 @@ Settings are automatically saved to your local machine.
         self.root.after(0, self._finish_auto_search_cancelled)
 
     def _finish_auto_search_cancelled(self):
+        log_info("Auto Search: cancelled")
         self.cancel_auto_search_btn.pack_forget()
         self.auto_search_btn.configure(state='normal')
         self.auto_search_status_label.configure(text="Auto search cancelled.", style='Info.TLabel')
@@ -1374,8 +1723,71 @@ Settings are automatically saved to your local machine.
     def _update_auto_search_status(self, message):
         self.auto_search_status_label.configure(text=message, style='Info.TLabel')
 
+    def _api_auth_headers(self):
+        return api_request_headers(self.auth_token)
+
+    def _run_sequential_match(self, live_template_b64, records):
+        """Run DBMatch against records in a subprocess; return {record, score} for page best."""
+        if not records:
+            return None
+        progress_queue = multiprocessing.Queue()
+        result_queue = multiprocessing.Queue()
+        p = multiprocessing.Process(
+            target=_sequential_match_worker_process,
+            args=(progress_queue, result_queue, live_template_b64, records),
+        )
+        self._auto_search_process = p
+        p.start()
+        result_received = None
+        while True:
+            if self.auto_search_cancelled:
+                break
+            try:
+                msg = progress_queue.get(timeout=0.3)
+                self.root.after(0, self._update_auto_search_status, f"Searching... {msg}")
+            except multiprocessing.queues.Empty:
+                pass
+            try:
+                result_received = result_queue.get_nowait()
+                break
+            except multiprocessing.queues.Empty:
+                pass
+            if not p.is_alive():
+                if result_received is None:
+                    result_received = ("error", "Match process ended unexpectedly.")
+                break
+            time.sleep(0.05)
+        if self._auto_search_process is not None:
+            try:
+                p.join(timeout=1.0)
+            except Exception:
+                pass
+            self._auto_search_process = None
+        if self.auto_search_cancelled:
+            return None
+        if result_received is None:
+            raise RuntimeError("Match process ended without result.")
+        status, value = result_received
+        if status == "error":
+            raise RuntimeError(value)
+        return value
+
+    def _load_passport_user_data(self, passport_number):
+        """Fetch full user payload for a passport number."""
+        response = requests.get(
+            f"{self.api_base_url}{passport_number}",
+            headers=self._api_auth_headers(),
+            timeout=15,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"Failed to load passport details: {response.status_code}")
+        payload = response.json()
+        if not payload.get("success"):
+            raise RuntimeError(payload.get("message", "Failed to load passport details"))
+        return payload.get("data")
+
     def _auto_search_thread(self):
-        """Capture fingerprint, POST to identify API, then load passport details."""
+        """Capture fingerprint, list templates page-by-page, match sequentially until found."""
         self._auto_search_process = None
         try:
             progress_queue = multiprocessing.Queue()
@@ -1421,82 +1833,117 @@ Settings are automatically saved to your local machine.
                 self.root.after(0, self._handle_auto_search_error, value)
                 return
 
-            template_b64 = value
-            self.root.after(0, self._update_auto_search_status, "📡 Searching database for matching fingerprint...")
-            headers = {"Content-Type": "application/json"}
-            if self.auth_token:
-                headers["Authorization"] = f"Bearer {self.auth_token}"
-            response = requests.post(
-                self.fingerprint_identify_url,
-                json={"template": template_b64},
-                headers=headers,
-                timeout=30,
+            live_template_b64 = value
+            headers = self._api_auth_headers()
+            page = 1
+            last_page = None
+            compared_total = 0
+            best_score = 0
+            best_record = None
+
+            self.root.after(0, self._update_auto_search_status, "Searching...")
+            log_info("Auto Search: fingerprint captured, searching database")
+
+            while not self.auto_search_cancelled:
+                page_label = f"page {page}" + (f"/{last_page}" if last_page else "")
+                self.root.after(
+                    0,
+                    self._update_auto_search_status,
+                    f"Searching... loading {page_label} ({compared_total} records checked)",
+                )
+                response = requests.get(
+                    self.fingerprint_identify_url,
+                    params={"limit": IDENTIFY_PAGE_LIMIT, "page": page},
+                    headers=headers,
+                    timeout=60,
+                )
+                if response.status_code != 200:
+                    err = f"Fingerprint list API error: {response.status_code} - {response.text}"
+                    log_error(f"Auto Search: {err}")
+                    self.root.after(0, self._handle_auto_search_error, err)
+                    return
+                try:
+                    payload = response.json()
+                except json.JSONDecodeError:
+                    self.root.after(0, self._handle_auto_search_error, "Invalid JSON from fingerprint list API")
+                    return
+                if not payload.get("success"):
+                    self.root.after(
+                        0,
+                        self._handle_auto_search_error,
+                        payload.get("message", "Failed to fetch fingerprint records"),
+                    )
+                    return
+
+                pagination = payload.get("pagination") or {}
+                last_page = pagination.get("last_page", page)
+                records = payload.get("data") or []
+                if not records:
+                    break
+
+                self.root.after(
+                    0,
+                    self._update_auto_search_status,
+                    f"Searching... {page_label} — comparing {len(records)} templates",
+                )
+                page_result = self._run_sequential_match(live_template_b64, records)
+                if self.auto_search_cancelled:
+                    return
+                if page_result:
+                    page_score = page_result.get("score", 0)
+                    page_record = page_result.get("record")
+                    if page_score > best_score and page_record:
+                        best_score = page_score
+                        best_record = page_record
+                        log_info(
+                            f"Auto Search: new best score {best_score} "
+                            f"passport={page_record.get('passport_number')}"
+                        )
+                    self.root.after(
+                        0,
+                        self._update_auto_search_status,
+                        f"Searching... best score so far: {best_score} (need {MATCH_SCORE_THRESHOLD}+)",
+                    )
+                    if best_score >= MATCH_SCORE_EARLY_EXIT:
+                        break
+
+                compared_total += len(records)
+                if page >= last_page:
+                    break
+                page += 1
+
+            if self.auto_search_cancelled:
+                return
+            if best_record and best_score >= MATCH_SCORE_THRESHOLD:
+                passport_number = best_record.get("passport_number")
+                if not passport_number:
+                    self.root.after(
+                        0,
+                        self._handle_auto_search_error,
+                        "Match found but passport number missing in API record.",
+                    )
+                    return
+                self.root.after(
+                    0,
+                    self._update_auto_search_status,
+                    f"Searching... match found ({passport_number}, score {best_score}), loading details...",
+                )
+                user_data = self._load_passport_user_data(passport_number)
+                self.root.after(0, self._handle_auto_search_success, user_data, best_score)
+                return
+            msg = (
+                f"No matching fingerprint found ({compared_total} records checked, "
+                f"best score {best_score})."
             )
-            if response.status_code not in (200, 201):
-                self.root.after(
-                    0,
-                    self._handle_auto_search_error,
-                    f"Identify API error: {response.status_code} - {response.text}",
-                )
-                return
-            try:
-                result = response.json()
-            except json.JSONDecodeError:
-                self.root.after(0, self._handle_auto_search_error, "Invalid JSON response from identify API")
-                return
-            if not result.get('success'):
-                self.root.after(
-                    0,
-                    self._handle_auto_search_error,
-                    result.get('message', 'No matching fingerprint found'),
-                )
-                return
-
-            data = result.get('data') or {}
-            user_data = data if isinstance(data, dict) and data.get('passport_number') and data.get('full_name') else None
-            passport_number = None
-            if user_data:
-                passport_number = user_data.get('passport_number')
-            elif isinstance(data, dict):
-                passport_number = data.get('passport_number')
-            else:
-                passport_number = data if isinstance(data, str) else None
-
-            if user_data:
-                self.root.after(0, self._handle_auto_search_success, user_data)
-                return
-            if not passport_number:
-                self.root.after(
-                    0,
-                    self._handle_auto_search_error,
-                    "Identify API succeeded but no passport number was returned.",
-                )
-                return
-
-            self.root.after(0, self._update_auto_search_status, f"📡 Loading details for passport {passport_number}...")
-            passport_response = requests.get(f"{self.api_base_url}{passport_number}", timeout=10)
-            if passport_response.status_code != 200:
-                self.root.after(
-                    0,
-                    self._handle_auto_search_error,
-                    f"Failed to load passport details: {passport_response.status_code}",
-                )
-                return
-            passport_data = passport_response.json()
-            if not passport_data.get('success'):
-                self.root.after(
-                    0,
-                    self._handle_auto_search_error,
-                    passport_data.get('message', 'Failed to load passport details'),
-                )
-                return
-            self.root.after(0, self._handle_auto_search_success, passport_data.get('data'))
+            log_info(f"Auto Search: {msg}")
+            self.root.after(0, self._handle_auto_search_error, msg)
         except Exception as e:
+            log_exception("Auto Search: thread failed", e)
             self.root.after(0, self._handle_auto_search_error, str(e))
         finally:
             self._auto_search_process = None
 
-    def _handle_auto_search_success(self, user_data):
+    def _handle_auto_search_success(self, user_data, match_score=None):
         self.cancel_auto_search_btn.pack_forget()
         self.auto_search_btn.configure(state='normal')
         if not user_data:
@@ -1505,19 +1952,28 @@ Settings are automatically saved to your local machine.
         self.current_auto_search_user_data = user_data
         self._display_auto_search_user_details(user_data)
         name = user_data.get('full_name') or user_data.get('passport_number') or 'User'
+        score_text = f" (score {match_score})" if match_score is not None else ""
+        log_info(f"Auto Search: match found {name}{score_text}")
         self.auto_search_status_label.configure(
-            text=f"✅ Match found: {name}",
+            text=f"✅ Match found: {name}{score_text}",
             style='Success.TLabel',
         )
-        messagebox.showinfo("Auto Search", f"User identified: {name}")
+        messagebox.showinfo("Auto Search", f"User identified: {name}{score_text}")
 
     def _handle_auto_search_error(self, error_message):
+        if error_message and "No matching fingerprint" in str(error_message):
+            log_info(f"Auto Search: {error_message}")
+        else:
+            log_error(f"Auto Search: {error_message}")
         self.cancel_auto_search_btn.pack_forget()
         self.auto_search_btn.configure(state='normal')
         self.auto_search_status_label.configure(text=f"Error: {error_message}", style='Error.TLabel')
         self.auto_search_details_frame.pack_forget()
         self.current_auto_search_user_data = None
-        messagebox.showerror("Auto Search", str(error_message))
+        if error_message and "No matching fingerprint" not in str(error_message):
+            messagebox.showerror("Auto Search", str(error_message))
+        else:
+            messagebox.showwarning("Auto Search", str(error_message))
 
     def _display_auto_search_user_details(self, user_data):
         for widget in self.auto_search_details_frame.winfo_children():
@@ -1530,6 +1986,8 @@ Settings are automatically saved to your local machine.
 
 
 def run_app():
+    install_global_exception_logger()
+    log_info(f"=== RTMS Biometric System started (log file: {logs_path()}) ===")
     root = tk.Tk()
     root.geometry("420x320")
     root.configure(bg="#f0f0f0")

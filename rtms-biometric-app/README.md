@@ -17,6 +17,7 @@ Runtime files (next to `main.py` when developing, or next to `FingerprintApp.exe
 
 - `app_settings.json` — server URL
 - `fingerprints-1.db` — local SQLite cache (settings tab info only; templates live on the API)
+- `logs.txt` — application and error logs (`[INFO]` / `[ERROR]` with timestamps)
 
 ## Prerequisites
 
@@ -66,7 +67,13 @@ pyinstaller --noconfirm fingerprint_app.spec
 | Auto Search | **All roles** |
 | Settings | **All roles** |
 
-**Auto Search** scans a fingerprint, calls `POST /api/v1/finger/identify` with the template, then loads passport details when a match is found.
+**Auto Search** scans a fingerprint, then:
+
+1. Fetches stored templates from `GET /api/v1/finger/identify?limit=50&page=N` (paginated list).
+2. Compares your scan against each template on the client using the ZKTeco matcher (`DBMatch`), page by page, until a match is found.
+3. Loads full passport details for the matched `passport_number`.
+
+The UI shows **Searching...** with page and record progress while this runs. With ~7k enrolled prints, a worst-case search can take several minutes.
 
 ## API endpoints used
 
@@ -79,7 +86,7 @@ Base URL comes from **Settings** (`server_url`), e.g. `http://rtmsbd.com`:
 | GET | `/api/v1/service-request/passport/{passport_number}` |
 | POST | `/api/v1/fingerprint/register` |
 | GET | `/api/v1/finger/passport/{passport_number}` |
-| POST | `/api/v1/finger/identify` |
+| GET | `/api/v1/finger/identify?limit=&page=` (template list for auto search) |
 
 ## Troubleshooting
 

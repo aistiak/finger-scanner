@@ -1,4 +1,10 @@
 {
-  "server_url": "http://rtmsbd.com",
-  "last_updated": "2026-06-01T00:00:00"
+  "server_url": "https://rtmsbd.com",
+  "last_updated": "2026-06-07T14:09:16.206484",
+  "remembered_user": {
+    "name": "ammanager",
+    "email": "ammanager@gmail.com",
+    "phone_number": "",
+    "role": "user"
+  }
 }
