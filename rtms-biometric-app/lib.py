@@ -637,9 +637,9 @@ class FingerprintApp:
         # Create tabs: Register/Match by role; Auto Search + Settings for everyone
         if self.can_register:
             self.create_register_tab()
+        self.create_auto_search_tab()
         if self.can_match:
             self.create_match_tab()
-        self.create_auto_search_tab()
         self.create_settings_tab()
         
         # API URLs from settings
