@@ -145,12 +145,32 @@ def extract_api_error_message(data, response):
     return str(data.get("error") or response.text or f"HTTP {response.status_code}")
 
 
+def normalize_branch_id(value):
+    """Return branch_id suitable for query params, or None if missing/invalid."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        value = value.get("id") or value.get("branch_id")
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return text
+
+
 def extract_login_user_info(data):
     """Map login API success payload to app user_info (supports nested or flat shapes)."""
     user_data = data.get("data")
     if not isinstance(user_data, dict):
         user_data = data.get("user") if isinstance(data.get("user"), dict) else {}
     token = user_data.get("token") or data.get("token") or data.get("access_token")
+    branch_raw = user_data.get("branch_id")
+    if branch_raw is None and isinstance(user_data.get("branch"), dict):
+        branch_raw = user_data["branch"].get("id")
+    if branch_raw is None:
+        branch_raw = data.get("branch_id")
     return {
         "name": user_data.get("name") or data.get("name") or "",
         "email": user_data.get("email") or data.get("email") or "",
@@ -158,7 +178,41 @@ def extract_login_user_info(data):
         "role": (user_data.get("role") or data.get("role") or "").strip().lower(),
         "token": token,
         "token_expires_at": user_data.get("token_expires_at") or data.get("token_expires_at"),
+        "branch_id": normalize_branch_id(branch_raw),
     }
+
+
+def resolve_branch_id(user_info=None, settings=None):
+    """Read branch_id from session user_info, remembered user, or saved settings."""
+    settings = settings or {}
+    user_info = user_info or {}
+    for source in (user_info, settings.get("remembered_user") or {}, settings):
+        branch_id = normalize_branch_id(source.get("branch_id"))
+        if branch_id is not None:
+            return branch_id
+    return None
+
+
+def persist_branch_id(branch_id):
+    """Save branch_id to app_settings.json (top-level and remembered_user when present)."""
+    branch_id = normalize_branch_id(branch_id)
+    if branch_id is None:
+        return
+    try:
+        settings = {}
+        if os.path.exists(settings_path()):
+            with open(settings_path(), "r", encoding="utf-8") as f:
+                settings = json.load(f)
+        settings["branch_id"] = branch_id
+        remembered = settings.get("remembered_user")
+        if isinstance(remembered, dict):
+            remembered["branch_id"] = branch_id
+            settings["remembered_user"] = remembered
+        settings["last_updated"] = datetime.now().isoformat()
+        with open(settings_path(), "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+    except Exception as e:
+        log_error(f"Could not save branch_id: {e}")
 
 
 def is_auth_ok_token_save_failed(data, response):
@@ -185,12 +239,16 @@ def remember_user_info(user_info):
         if os.path.exists(settings_path()):
             with open(settings_path(), "r", encoding="utf-8") as f:
                 settings = json.load(f)
+        branch_id = normalize_branch_id(user_info.get("branch_id"))
         settings["remembered_user"] = {
             "name": user_info.get("name") or "",
             "email": user_info.get("email") or "",
             "phone_number": user_info.get("phone_number") or "",
             "role": user_info.get("role") or "",
+            "branch_id": branch_id,
         }
+        if branch_id is not None:
+            settings["branch_id"] = branch_id
         settings["last_updated"] = datetime.now().isoformat()
         with open(settings_path(), "w", encoding="utf-8") as f:
             json.dump(settings, f, indent=2)
@@ -201,6 +259,7 @@ def remember_user_info(user_info):
 def user_info_without_token(email, remembered=None):
     """Build session user_info when API auth succeeded but no token is available."""
     remembered = remembered or {}
+    settings = _load_settings_for_login()
     email = (email or "").strip()
     if remembered.get("email", "").lower() == email.lower():
         return {
@@ -208,6 +267,7 @@ def user_info_without_token(email, remembered=None):
             "email": email,
             "phone_number": remembered.get("phone_number") or "",
             "role": (remembered.get("role") or "user").strip().lower(),
+            "branch_id": resolve_branch_id(remembered, settings),
             "token": None,
             "token_expires_at": None,
             "_login_without_token": True,
@@ -217,6 +277,7 @@ def user_info_without_token(email, remembered=None):
         "email": email,
         "phone_number": "",
         "role": "user",
+        "branch_id": resolve_branch_id({}, settings),
         "token": None,
         "token_expires_at": None,
         "_login_without_token": True,
@@ -544,8 +605,10 @@ class LoginScreen:
                 if not user_info.get("email"):
                     user_info["email"] = email
                 remember_user_info(user_info)
+                persist_branch_id(user_info.get("branch_id"))
                 log_info(
                     f"Login success: {user_info.get('email')} role={user_info.get('role')} "
+                    f"branch_id={user_info.get('branch_id')} "
                     f"token={'yes' if user_info.get('token') else 'no'}"
                 )
                 self.status_label.configure(text="")
@@ -633,6 +696,11 @@ class FingerprintApp:
         
         # Load settings
         self.settings = self.load_settings()
+        session_branch_id = resolve_branch_id(self.user_info, self.settings)
+        if session_branch_id is not None:
+            self.settings["branch_id"] = session_branch_id
+            if normalize_branch_id(self.user_info.get("branch_id")) is not None:
+                persist_branch_id(session_branch_id)
         
         # Create tabs: Register/Match by role; Auto Search + Settings for everyone
         if self.can_register:
@@ -650,7 +718,8 @@ class FingerprintApp:
         self.fingerprint_identify_url = server_url + "/api/v1/finger/identify"
         self.login_url_base = server_url.rstrip('/')  # for logout
         log_info(
-            f"App started: user={name_display} role={role_display} server={server_url}"
+            f"App started: user={name_display} role={role_display} "
+            f"branch_id={resolve_branch_id(self.user_info, self.settings)} server={server_url}"
         )
 
     def _logout(self):
@@ -1842,7 +1911,11 @@ Settings are automatically saved to your local machine.
             best_record = None
 
             self.root.after(0, self._update_auto_search_status, "Searching...")
-            log_info("Auto Search: fingerprint captured, searching database")
+            branch_id = resolve_branch_id(self.user_info, self.settings)
+            if branch_id is not None:
+                log_info(f"Auto Search: fingerprint captured, searching branch_id={branch_id}")
+            else:
+                log_info("Auto Search: fingerprint captured, searching database (all branches)")
 
             while not self.auto_search_cancelled:
                 page_label = f"page {page}" + (f"/{last_page}" if last_page else "")
@@ -1851,9 +1924,12 @@ Settings are automatically saved to your local machine.
                     self._update_auto_search_status,
                     f"Searching... loading {page_label} ({compared_total} records checked)",
                 )
+                params = {"limit": IDENTIFY_PAGE_LIMIT, "page": page}
+                if branch_id is not None:
+                    params["branch_id"] = branch_id
                 response = requests.get(
                     self.fingerprint_identify_url,
-                    params={"limit": IDENTIFY_PAGE_LIMIT, "page": page},
+                    params=params,
                     headers=headers,
                     timeout=60,
                 )
