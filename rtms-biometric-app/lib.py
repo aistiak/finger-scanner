@@ -256,6 +256,30 @@ def remember_user_info(user_info):
         log_error(f"Could not save remembered user: {e}")
 
 
+def clear_remembered_user_settings():
+    """Remove remembered user and branch_id from app_settings.json (e.g. on logout)."""
+    try:
+        path = settings_path()
+        if not os.path.exists(path):
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+        changed = False
+        if "remembered_user" in settings:
+            del settings["remembered_user"]
+            changed = True
+        if "branch_id" in settings:
+            del settings["branch_id"]
+            changed = True
+        if not changed:
+            return
+        settings["last_updated"] = datetime.now().isoformat()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+    except Exception as e:
+        log_error(f"Could not clear remembered user settings: {e}")
+
+
 def user_info_without_token(email, remembered=None):
     """Build session user_info when API auth succeeded but no token is available."""
     remembered = remembered or {}
@@ -741,6 +765,7 @@ class FingerprintApp:
 
     def _on_logout_done(self):
         """Switch back to login screen (clear main app, show login)."""
+        clear_remembered_user_settings()
         log_info("User logged out")
         if self.on_logout:
             self.on_logout()
