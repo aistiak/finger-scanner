@@ -183,7 +183,7 @@ def extract_login_user_info(data):
 
 
 def resolve_registration_id(user_data):
-    """Read registration ID from user or match API payload."""
+    """Read registration ID from user or match API payload (not passport_number)."""
     if not isinstance(user_data, dict):
         return None
     id_keys = ("registration_id", "registration_number")
@@ -194,9 +194,6 @@ def resolve_registration_id(user_data):
             value = source.get(key)
             if value is not None and str(value).strip():
                 return str(value).strip()
-    passport_number = user_data.get("passport_number")
-    if passport_number is not None and str(passport_number).strip():
-        return str(passport_number).strip()
     return None
 
 
@@ -1512,7 +1509,6 @@ Settings are automatically saved to your local machine.
             registration_id = (
                 lookup_payload.get('registration_id')
                 or lookup_payload.get('registration_number')
-                or lookup_payload.get('passport_number')
             )
             if registration_id is not None:
                 self.root.after(0, self._apply_match_registration_id, registration_id)
@@ -2074,7 +2070,6 @@ Settings are automatically saved to your local machine.
                 registration_id = (
                     best_record.get("registration_id")
                     or best_record.get("registration_number")
-                    or best_record.get("passport_number")
                 )
                 if registration_id is not None and user_data is not None:
                     user_data = dict(user_data)
