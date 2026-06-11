@@ -182,6 +182,17 @@ def extract_login_user_info(data):
     }
 
 
+def resolve_registration_id(user_data):
+    """Read registration_id from user payload (top-level or nested under fingerprint)."""
+    if not isinstance(user_data, dict):
+        return None
+    for source in (user_data, user_data.get("fingerprint") or {}):
+        value = source.get("registration_id")
+        if value is not None and str(value).strip():
+            return value
+    return None
+
+
 def resolve_branch_id(user_info=None, settings=None):
     """Read branch_id from session user_info, remembered user, or saved settings."""
     settings = settings or {}
@@ -1078,6 +1089,12 @@ Settings are automatically saved to your local machine.
         personal_frame.pack(fill='x', pady=(0, 10))
         self._add_detail_row(personal_frame, "Full Name:", user_data.get('full_name', 'N/A'))
         self._add_detail_row(personal_frame, "Passport Number:", user_data.get('passport_number', 'N/A'))
+        registration_id = resolve_registration_id(user_data)
+        self._add_detail_row(
+            personal_frame,
+            "Registration ID:",
+            registration_id if registration_id is not None else 'N/A',
+        )
         self._add_detail_row(personal_frame, "Phone:", user_data.get('phone', 'N/A'))
         self._add_detail_row(personal_frame, "Father's Name:", user_data.get('father_name', 'N/A'))
         self._add_detail_row(personal_frame, "Birth Date:", self._format_date(user_data.get('birth_date')))
@@ -1480,10 +1497,14 @@ Settings are automatically saved to your local machine.
                 self.root.after(0, self._handle_match_error, lookup_data.get('message', 'Failed to retrieve template'))
                 return
             
-            stored_template_b64 = lookup_data.get('data', {}).get('template')
+            lookup_payload = lookup_data.get('data') or {}
+            stored_template_b64 = lookup_payload.get('template')
             if not stored_template_b64:
                 self.root.after(0, self._handle_match_error, "No template found in API response")
                 return
+            registration_id = lookup_payload.get('registration_id')
+            if registration_id is not None:
+                self.root.after(0, self._apply_match_registration_id, registration_id)
             
             # Run device capture and match in a separate process so handle is released when done
             progress_queue = multiprocessing.Queue()
@@ -1557,6 +1578,15 @@ Settings are automatically saved to your local machine.
     def _update_match_status(self, message):
         """Update match status in GUI"""
         self.match_result_label.configure(text=message, style='Info.TLabel')
+
+    def _apply_match_registration_id(self, registration_id):
+        """Merge registration_id from match API into displayed user details."""
+        if not self.current_match_user_data:
+            return
+        updated = dict(self.current_match_user_data)
+        updated["registration_id"] = registration_id
+        self.current_match_user_data = updated
+        self._display_match_user_details(updated)
             
     def _handle_match_result(self, result):
         """Handle fingerprint match result"""
@@ -2030,6 +2060,10 @@ Settings are automatically saved to your local machine.
                     f"Searching... match found ({passport_number}, score {best_score}), loading details...",
                 )
                 user_data = self._load_passport_user_data(passport_number)
+                registration_id = best_record.get("registration_id")
+                if registration_id is not None and user_data is not None:
+                    user_data = dict(user_data)
+                    user_data["registration_id"] = registration_id
                 self.root.after(0, self._handle_auto_search_success, user_data, best_score)
                 return
             msg = (
