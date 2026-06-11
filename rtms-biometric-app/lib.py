@@ -183,13 +183,20 @@ def extract_login_user_info(data):
 
 
 def resolve_registration_id(user_data):
-    """Read registration_id from user payload (top-level or nested under fingerprint)."""
+    """Read registration ID from user or match API payload."""
     if not isinstance(user_data, dict):
         return None
+    id_keys = ("registration_id", "registration_number")
     for source in (user_data, user_data.get("fingerprint") or {}):
-        value = source.get("registration_id")
-        if value is not None and str(value).strip():
-            return value
+        if not isinstance(source, dict):
+            continue
+        for key in id_keys:
+            value = source.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+    passport_number = user_data.get("passport_number")
+    if passport_number is not None and str(passport_number).strip():
+        return str(passport_number).strip()
     return None
 
 
@@ -1087,14 +1094,14 @@ Settings are automatically saved to your local machine.
         """Fill personal, fingerprint, service, and location sections into details_container."""
         personal_frame = ttk.LabelFrame(details_container, text="Personal Information", padding=10)
         personal_frame.pack(fill='x', pady=(0, 10))
-        self._add_detail_row(personal_frame, "Full Name:", user_data.get('full_name', 'N/A'))
-        self._add_detail_row(personal_frame, "Passport Number:", user_data.get('passport_number', 'N/A'))
         registration_id = resolve_registration_id(user_data)
         self._add_detail_row(
             personal_frame,
             "Registration ID:",
             registration_id if registration_id is not None else 'N/A',
         )
+        self._add_detail_row(personal_frame, "Full Name:", user_data.get('full_name', 'N/A'))
+        self._add_detail_row(personal_frame, "Passport Number:", user_data.get('passport_number', 'N/A'))
         self._add_detail_row(personal_frame, "Phone:", user_data.get('phone', 'N/A'))
         self._add_detail_row(personal_frame, "Father's Name:", user_data.get('father_name', 'N/A'))
         self._add_detail_row(personal_frame, "Birth Date:", self._format_date(user_data.get('birth_date')))
@@ -1502,7 +1509,11 @@ Settings are automatically saved to your local machine.
             if not stored_template_b64:
                 self.root.after(0, self._handle_match_error, "No template found in API response")
                 return
-            registration_id = lookup_payload.get('registration_id')
+            registration_id = (
+                lookup_payload.get('registration_id')
+                or lookup_payload.get('registration_number')
+                or lookup_payload.get('passport_number')
+            )
             if registration_id is not None:
                 self.root.after(0, self._apply_match_registration_id, registration_id)
             
@@ -2060,7 +2071,11 @@ Settings are automatically saved to your local machine.
                     f"Searching... match found ({passport_number}, score {best_score}), loading details...",
                 )
                 user_data = self._load_passport_user_data(passport_number)
-                registration_id = best_record.get("registration_id")
+                registration_id = (
+                    best_record.get("registration_id")
+                    or best_record.get("registration_number")
+                    or best_record.get("passport_number")
+                )
                 if registration_id is not None and user_data is not None:
                     user_data = dict(user_data)
                     user_data["registration_id"] = registration_id
