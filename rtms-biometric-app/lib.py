@@ -210,9 +210,14 @@ def enrich_user_data_with_registration_id(user_data, fingerprint_lookup_url, aut
         url = f"{fingerprint_lookup_url.rstrip('/')}/{passport_number}"
         response = requests.get(url, headers=api_request_headers(auth_token), timeout=10)
         if response.status_code != 200:
+            log_error(
+                f"registration_id lookup failed HTTP {response.status_code} for {passport_number}"
+            )
             return user_data
         payload, parse_err = parse_api_response(response)
         if parse_err or not payload.get("success"):
+            if parse_err:
+                log_error(f"registration_id lookup failed for {passport_number}: {parse_err}")
             return user_data
         finger_data = payload.get("data") or {}
         registration_id = resolve_registration_id(finger_data)
@@ -220,6 +225,7 @@ def enrich_user_data_with_registration_id(user_data, fingerprint_lookup_url, aut
             return user_data
         enriched = dict(user_data)
         enriched["registration_id"] = registration_id
+        log_info(f"Loaded registration_id={registration_id} for passport {passport_number}")
         return enriched
     except Exception as e:
         log_error(f"Could not load registration_id for {passport_number}: {e}")
@@ -770,6 +776,14 @@ class FingerprintApp:
             if normalize_branch_id(self.user_info.get("branch_id")) is not None:
                 persist_branch_id(session_branch_id)
         
+        # API URLs from settings (before tabs; used when enriching user details)
+        server_url = normalize_server_url(self.settings.get('server_url'))
+        self.api_base_url = server_url + "/api/v1/service-request/passport/"
+        self.fingerprint_api_url = server_url + "/api/v1/fingerprint/register"
+        self.fingerprint_lookup_url = server_url + "/api/v1/finger/passport"
+        self.fingerprint_identify_url = server_url + "/api/v1/finger/identify"
+        self.login_url_base = server_url.rstrip('/')  # for logout
+
         # Create tabs: Register/Match by role; Auto Search + Settings for everyone
         if self.can_register:
             self.create_register_tab()
@@ -777,14 +791,6 @@ class FingerprintApp:
         if self.can_match:
             self.create_match_tab()
         self.create_settings_tab()
-        
-        # API URLs from settings
-        server_url = normalize_server_url(self.settings.get('server_url'))
-        self.api_base_url = server_url + "/api/v1/service-request/passport/"
-        self.fingerprint_api_url = server_url + "/api/v1/fingerprint/register"
-        self.fingerprint_lookup_url = server_url + "/api/v1/finger/passport"
-        self.fingerprint_identify_url = server_url + "/api/v1/finger/identify"
-        self.login_url_base = server_url.rstrip('/')  # for logout
         log_info(
             f"App started: user={name_display} role={role_display} "
             f"branch_id={resolve_branch_id(self.user_info, self.settings)} server={server_url}"
@@ -1118,8 +1124,18 @@ Settings are automatically saved to your local machine.
         self.register_fp_btn.configure(state='disabled')
         self.current_user_data = None
         
+    def _ensure_registration_id(self, user_data):
+        """Merge registration_id from finger/passport API when absent on passport payload."""
+        if not user_data:
+            return user_data
+        return enrich_user_data_with_registration_id(
+            user_data, self.fingerprint_lookup_url, self.auth_token
+        )
+
     def _display_user_details(self, user_data):
         """Display user details with left (details) and right (photo/emoji) layout"""
+        user_data = self._ensure_registration_id(user_data)
+        self.current_user_data = user_data
         for widget in self.details_frame.winfo_children():
             widget.destroy()
         self.details_frame.pack(fill='x', pady=(0, 20))
@@ -1857,6 +1873,8 @@ Settings are automatically saved to your local machine.
         
     def _display_match_user_details(self, user_data):
         """Display user details with left (details) and right (photo/emoji) layout"""
+        user_data = self._ensure_registration_id(user_data)
+        self.current_match_user_data = user_data
         for widget in self.match_details_frame.winfo_children():
             widget.destroy()
         self.match_details_frame.pack(fill='x', pady=(0, 20))
@@ -1964,7 +1982,10 @@ Settings are automatically saved to your local machine.
         payload = response.json()
         if not payload.get("success"):
             raise RuntimeError(payload.get("message", "Failed to load passport details"))
-        return payload.get("data")
+        user_data = payload.get("data")
+        return enrich_user_data_with_registration_id(
+            user_data, self.fingerprint_lookup_url, self.auth_token
+        )
 
     def _auto_search_thread(self):
         """Capture fingerprint, list templates page-by-page, match sequentially until found."""
@@ -2170,6 +2191,8 @@ Settings are automatically saved to your local machine.
             messagebox.showwarning("Auto Search", str(error_message))
 
     def _display_auto_search_user_details(self, user_data):
+        user_data = self._ensure_registration_id(user_data)
+        self.current_auto_search_user_data = user_data
         for widget in self.auto_search_details_frame.winfo_children():
             widget.destroy()
         self.auto_search_details_frame.pack(fill='both', expand=True, pady=(0, 0))
