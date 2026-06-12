@@ -197,6 +197,35 @@ def resolve_registration_id(user_data):
     return None
 
 
+def enrich_user_data_with_registration_id(user_data, fingerprint_lookup_url, auth_token=None):
+    """Load registration_id from GET /api/v1/finger/passport when missing on passport payload."""
+    if not isinstance(user_data, dict):
+        return user_data
+    if resolve_registration_id(user_data) is not None:
+        return user_data
+    passport_number = user_data.get("passport_number")
+    if not passport_number:
+        return user_data
+    try:
+        url = f"{fingerprint_lookup_url.rstrip('/')}/{passport_number}"
+        response = requests.get(url, headers=api_request_headers(auth_token), timeout=10)
+        if response.status_code != 200:
+            return user_data
+        payload, parse_err = parse_api_response(response)
+        if parse_err or not payload.get("success"):
+            return user_data
+        finger_data = payload.get("data") or {}
+        registration_id = resolve_registration_id(finger_data)
+        if registration_id is None:
+            return user_data
+        enriched = dict(user_data)
+        enriched["registration_id"] = registration_id
+        return enriched
+    except Exception as e:
+        log_error(f"Could not load registration_id for {passport_number}: {e}")
+        return user_data
+
+
 def resolve_branch_id(user_info=None, settings=None):
     """Read branch_id from session user_info, remembered user, or saved settings."""
     settings = settings or {}
@@ -1029,21 +1058,31 @@ Settings are automatically saved to your local machine.
         try:
             url = f"{self.api_base_url}{passport_number}"
             response = requests.get(url, headers=api_request_headers(self.auth_token), timeout=10)
+            user_data = None
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    if data.get('success') and isinstance(data.get('data'), dict):
+                        user_data = enrich_user_data_with_registration_id(
+                            data['data'], self.fingerprint_lookup_url, self.auth_token
+                        )
+                except json.JSONDecodeError:
+                    pass
             
             # Schedule UI update in main thread
-            self.root.after(0, self._handle_api_response, response, passport_number)
+            self.root.after(0, self._handle_api_response, response, passport_number, user_data)
             
         except requests.exceptions.RequestException as e:
             log_exception(f"Register tab: passport search failed ({passport_number})", e)
             self.root.after(0, self._handle_api_error, str(e))
             
-    def _handle_api_response(self, response, passport_number):
+    def _handle_api_response(self, response, passport_number, enriched_user_data=None):
         """Handle API response in main thread"""
         try:
             if response.status_code == 200:
                 data = response.json()
                 if data.get('success'):
-                    self.current_user_data = data.get('data')
+                    self.current_user_data = enriched_user_data if enriched_user_data is not None else data.get('data')
                     self._display_user_details(self.current_user_data)
                     self.loading_label.configure(text="User found successfully!", style='Success.TLabel')
                     log_info(f"Register tab: user found {passport_number}")
@@ -1768,21 +1807,31 @@ Settings are automatically saved to your local machine.
             url = f"{self.api_base_url}{passport_number}"
             response = requests.get(url, headers=api_request_headers(self.auth_token), timeout=10)
             log_info(f"Match tab: passport API {url} status={response.status_code}")
+            user_data = None
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    if data.get('success') and isinstance(data.get('data'), dict):
+                        user_data = enrich_user_data_with_registration_id(
+                            data['data'], self.fingerprint_lookup_url, self.auth_token
+                        )
+                except json.JSONDecodeError:
+                    pass
             
             # Schedule UI update in main thread
-            self.root.after(0, self._handle_match_api_response, response, passport_number)
+            self.root.after(0, self._handle_match_api_response, response, passport_number, user_data)
             
         except requests.exceptions.RequestException as e:
             log_exception(f"Match tab: passport search failed ({passport_number})", e)
             self.root.after(0, self._handle_match_api_error, str(e))
             
-    def _handle_match_api_response(self, response, passport_number):
+    def _handle_match_api_response(self, response, passport_number, enriched_user_data=None):
         """Handle API response in main thread"""
         try:
             if response.status_code == 200:
                 data = response.json()
                 if data.get('success'):
-                    self.current_match_user_data = data.get('data')
+                    self.current_match_user_data = enriched_user_data if enriched_user_data is not None else data.get('data')
                     self._display_match_user_details(self.current_match_user_data)
                     self.match_loading_label.configure(text="User found successfully!", style='Success.TLabel')
                     log_info(f"Match tab: user found {passport_number}")
