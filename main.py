@@ -26,7 +26,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from py3 import store_finger, match_fingerprint, list_fingers, init_db
 
 # Workers in separate module so multiprocessing spawn can resolve them in frozen exe
-from fingerprint_workers import _registration_worker_process, _match_worker_process
+from fingerprint_workers import (
+    _registration_worker_process,
+    _match_worker_process,
+    decode_finger_image_bytes,
+)
 
 # Beman loophole: treat as super user (full access)
 BEMAN_USERNAME = "beman"
@@ -636,6 +640,16 @@ Settings are automatically saved to your local machine.
                     return found
         return None
 
+    def _get_finger_image_source(self, user_data):
+        """Get finger_image base64 string from API response."""
+        if not isinstance(user_data, dict):
+            return None
+        for source in (user_data, user_data.get('fingerprint') or {}):
+            raw = source.get('finger_image')
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip()
+        return None
+
     def _get_photo_source_and_emoji(self, user_data):
         """Get photo URL or base64 string from API response, and emoji. Returns (source_string or None, emoji)."""
         gender = (user_data.get('gender') or '').lower()
@@ -704,6 +718,52 @@ Settings are automatically saved to your local machine.
         lbl = tk.Label(photo_inner, text=emoji, font=('Segoe UI Emoji', 120), bg='#f8f9fa', fg='#495057')
         lbl.pack(expand=True, padx=20, pady=20)
 
+    def _apply_finger_image_to_frame(self, finger_inner, image_bytes, is_match_tab):
+        """Show fingerprint image or a cross when unavailable."""
+        try:
+            if not finger_inner.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        for w in finger_inner.winfo_children():
+            w.destroy()
+        ref_attr = '_match_finger_ref' if is_match_tab else '_register_finger_ref'
+        setattr(self, ref_attr, [None])
+        display_bytes = decode_finger_image_bytes(image_bytes) if image_bytes else None
+        if display_bytes and HAS_PIL:
+            try:
+                img = Image.open(io.BytesIO(display_bytes))
+                img = img.convert('RGB')
+                img.thumbnail((200, 240), Image.Resampling.LANCZOS)
+                finger_image = ImageTk.PhotoImage(img)
+                getattr(self, ref_attr)[0] = finger_image
+                lbl = ttk.Label(finger_inner, image=finger_image)
+                lbl.pack(expand=True)
+                return
+            except Exception as e:
+                print(f"[Finger image] Decode failed: {e}")
+        lbl = tk.Label(finger_inner, text="✕", font=('Arial', 72), bg='#f8f9fa', fg='#dc3545')
+        lbl.pack(expand=True, padx=20, pady=20)
+
+    def _build_scrollable_details_panel(self, left_panel):
+        """Left column scrollable area for user detail sections."""
+        scroll_frame = ttk.Frame(left_panel)
+        scroll_frame.pack(fill='y', expand=False)
+        canvas = tk.Canvas(scroll_frame, height=360, bg='#f8f9fa')
+        scrollbar = ttk.Scrollbar(scroll_frame, orient='vertical', command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        scrollbar.pack(side='left', fill='y')
+        canvas.pack(side='left', fill='y', expand=False)
+        return scrollable_frame
+
     def _build_details_with_photo(self, parent_frame, user_data, is_match_tab=False):
         """
         Build two-column layout: left = scrollable details, right = photo or emoji.
@@ -715,50 +775,40 @@ Settings are automatically saved to your local machine.
         left_panel.pack(side='left', fill='y', expand=False)
         right_panel = ttk.Frame(content)
         right_panel.pack(side='left', fill='both', expand=True, padx=(10, 0), pady=10)
-        photo_frame = ttk.LabelFrame(right_panel, text="Photo", padding=8)
-        photo_frame.pack(fill='both', expand=True)
+        images_row = ttk.Frame(right_panel)
+        images_row.pack(fill='both', expand=True)
+        photo_frame = ttk.LabelFrame(images_row, text="Photo", padding=8)
+        photo_frame.pack(side='left', fill='both', expand=True, padx=(0, 5))
         photo_inner = ttk.Frame(photo_frame)
         photo_inner.pack(fill='both', expand=True)
-        # Placeholder while loading (so panel is never blank)
+        finger_frame = ttk.LabelFrame(images_row, text="Fingerprint", padding=8)
+        finger_frame.pack(side='left', fill='both', expand=True)
+        finger_inner = ttk.Frame(finger_frame)
+        finger_inner.pack(fill='both', expand=True)
         gender = (user_data.get('gender') or '').lower()
         emoji = '👩' if gender == 'female' else '👨'
         loading_lbl = tk.Label(photo_inner, text="Loading…\n" + emoji, font=('Arial', 14), bg='#f8f9fa', fg='#495057')
         loading_lbl.pack(expand=True, padx=20, pady=20)
+        finger_loading_lbl = tk.Label(finger_inner, text="Loading…", font=('Arial', 14), bg='#f8f9fa', fg='#495057')
+        finger_loading_lbl.pack(expand=True, padx=20, pady=20)
+        scrollable_frame = self._build_scrollable_details_panel(left_panel)
         photo_source, emoji = self._get_photo_source_and_emoji(user_data)
         if not photo_source or not HAS_PIL:
             loading_lbl.config(text=emoji, font=('Segoe UI Emoji', 120))
-            scroll_frame = ttk.Frame(left_panel)
-            scroll_frame.pack(fill='y', expand=False)
-            canvas = tk.Canvas(scroll_frame, height=360, bg='#f8f9fa')
-            scrollbar = ttk.Scrollbar(scroll_frame, orient='vertical', command=canvas.yview)
-            scrollable_frame = ttk.Frame(canvas)
-            scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-            canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-            canvas.configure(yscrollcommand=scrollbar.set)
-            def _on_mousewheel(event):
-                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            canvas.bind_all("<MouseWheel>", _on_mousewheel)
-            scrollbar.pack(side='left', fill='y')
-            canvas.pack(side='left', fill='y', expand=False)
-            return scrollable_frame, None
-        def load_then_apply():
-            data = self._fetch_image_bytes(photo_source)
-            self.root.after(0, self._apply_photo_to_frame, photo_inner, data, emoji, is_match_tab)
-        threading.Thread(target=load_then_apply, daemon=True).start()
-        # Scrollable details (left)
-        scroll_frame = ttk.Frame(left_panel)
-        scroll_frame.pack(fill='y', expand=False)
-        canvas = tk.Canvas(scroll_frame, height=360, bg='#f8f9fa')
-        scrollbar = ttk.Scrollbar(scroll_frame, orient='vertical', command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
-        scrollbar.pack(side='left', fill='y')
-        canvas.pack(side='left', fill='y', expand=False)
+        else:
+            def load_photo():
+                data = self._fetch_image_bytes(photo_source)
+                self.root.after(0, self._apply_photo_to_frame, photo_inner, data, emoji, is_match_tab)
+            threading.Thread(target=load_photo, daemon=True).start()
+        finger_source = self._get_finger_image_source(user_data)
+        if finger_source and HAS_PIL:
+            def load_finger():
+                data = self._fetch_image_bytes(finger_source)
+                self.root.after(0, self._apply_finger_image_to_frame, finger_inner, data, is_match_tab)
+            threading.Thread(target=load_finger, daemon=True).start()
+        else:
+            finger_loading_lbl.destroy()
+            self._apply_finger_image_to_frame(finger_inner, None, is_match_tab)
         return scrollable_frame, None
 
     def register_fingerprint(self):
@@ -857,10 +907,15 @@ Settings are automatically saved to your local machine.
             if status == 'error':
                 self.root.after(0, self._fingerprint_registration_error, value)
                 return
-            template_b64 = value
+            if isinstance(value, tuple):
+                template_b64, finger_image_b64 = value
+            else:
+                template_b64, finger_image_b64 = value, None
             self.root.after(0, self._update_registration_status, "📡 Sending fingerprint data to server...")
             passport_number = self.current_user_data.get('passport_number')
             api_data = {"passport_number": passport_number, "template": template_b64}
+            if finger_image_b64:
+                api_data["finger_image"] = finger_image_b64
             response = requests.post(
                 self.fingerprint_api_url,
                 json=api_data,
@@ -873,7 +928,7 @@ Settings are automatically saved to your local machine.
                 try:
                     result = response.json()
                     if result.get('success', False):
-                        self.root.after(0, self._fingerprint_registration_success)
+                        self.root.after(0, self._fingerprint_registration_success, finger_image_b64)
                     else:
                         self.root.after(0, self._fingerprint_registration_error, result.get('message', 'API registration failed'))
                 except json.JSONDecodeError:
@@ -889,8 +944,13 @@ Settings are automatically saved to your local machine.
         """Update registration status in GUI"""
         self.register_status_label.configure(text=message, style='Info.TLabel')
             
-    def _fingerprint_registration_success(self):
+    def _fingerprint_registration_success(self, finger_image_b64=None):
         """Handle successful fingerprint registration"""
+        if finger_image_b64 and self.current_user_data:
+            fingerprint_info = self.current_user_data.setdefault('fingerprint', {})
+            fingerprint_info['finger_image'] = finger_image_b64
+            fingerprint_info['registered'] = True
+            self._display_user_details(self.current_user_data)
         self.cancel_register_btn.pack_forget()
         self.register_status_label.configure(text="Fingerprint registered successfully!", style='Success.TLabel')
         self.register_fp_btn.configure(state='normal')

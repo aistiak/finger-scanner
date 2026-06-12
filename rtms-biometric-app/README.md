@@ -7,7 +7,8 @@ Refactored, self-contained Windows desktop client for RTMS fingerprint registrat
 | File | Purpose |
 |------|---------|
 | `main.py` | Entry point — starts the GUI |
-| `lib.py` | Application logic (login, tabs, API, scanner workers, local DB helpers) |
+| `lib.py` | Application logic (login, tabs, API, local DB helpers) |
+| `fingerprint_workers.py` | Scanner worker processes and finger-image encode/decode helpers |
 | `requirements.txt` | Python dependencies |
 | `app_settings.json` | Default server URL (created/updated at runtime next to the exe when built) |
 | `build.bat` | One-click Windows build (venv + PyInstaller) |
@@ -95,12 +96,6 @@ Base URL comes from **Settings** (`server_url`), e.g. `http://rtmsbd.com`:
 - **Build: Access denied** — Close `FingerprintApp.exe` if it is running, then rebuild.
 - **Identify / auto search fails** — Ensure Laravel exposes `POST /api/v1/finger/identify` and returns `success` with `passport_number` or full user `data`.
 
-## Regenerating `lib.py`
+## Development notes
 
-If the parent `main.py` changes and you want to refresh this package without editing by hand:
-
-```bat
-python _generate_lib.py
-```
-
-Then review the diff; parent code is the source of truth until you merge changes manually.
+All application code lives in this folder (`main.py`, `lib.py`, `fingerprint_workers.py`). Edit files here directly; the legacy scripts in the parent `finger-scanner` directory are not used by this app.

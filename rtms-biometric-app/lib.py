@@ -20,6 +20,13 @@ try:
 except ImportError:
     HAS_PIL = False
 
+from fingerprint_workers import (
+    decode_finger_image_bytes,
+    _registration_worker_process,
+    _match_worker_process,
+    _sequential_match_worker_process,
+)
+
 
 def app_dir():
     """Directory for settings/DB: exe folder when frozen, else this package folder."""
@@ -198,10 +205,16 @@ def resolve_registration_id(user_data):
 
 
 def enrich_user_data_with_registration_id(user_data, fingerprint_lookup_url, auth_token=None):
-    """Load registration_id from GET /api/v1/finger/passport when missing on passport payload."""
+    """Load registration_id and finger_image from GET /api/v1/finger/passport when missing."""
     if not isinstance(user_data, dict):
         return user_data
-    if resolve_registration_id(user_data) is not None:
+    fingerprint_info = user_data.get("fingerprint") or {}
+    needs_registration_id = resolve_registration_id(user_data) is None
+    needs_finger_image = not (
+        (isinstance(user_data.get("finger_image"), str) and user_data.get("finger_image").strip())
+        or (isinstance(fingerprint_info.get("finger_image"), str) and fingerprint_info.get("finger_image").strip())
+    )
+    if not needs_registration_id and not needs_finger_image:
         return user_data
     passport_number = user_data.get("passport_number")
     if not passport_number:
@@ -211,24 +224,32 @@ def enrich_user_data_with_registration_id(user_data, fingerprint_lookup_url, aut
         response = requests.get(url, headers=api_request_headers(auth_token), timeout=10)
         if response.status_code != 200:
             log_error(
-                f"registration_id lookup failed HTTP {response.status_code} for {passport_number}"
+                f"Fingerprint lookup failed HTTP {response.status_code} for {passport_number}"
             )
             return user_data
         payload, parse_err = parse_api_response(response)
         if parse_err or not payload.get("success"):
             if parse_err:
-                log_error(f"registration_id lookup failed for {passport_number}: {parse_err}")
+                log_error(f"Fingerprint lookup failed for {passport_number}: {parse_err}")
             return user_data
         finger_data = payload.get("data") or {}
-        registration_id = resolve_registration_id(finger_data)
-        if registration_id is None:
-            return user_data
         enriched = dict(user_data)
-        enriched["registration_id"] = registration_id
-        log_info(f"Loaded registration_id={registration_id} for passport {passport_number}")
-        return enriched
+        changed = False
+        registration_id = resolve_registration_id(finger_data)
+        if needs_registration_id and registration_id is not None:
+            enriched["registration_id"] = registration_id
+            changed = True
+            log_info(f"Loaded registration_id={registration_id} for passport {passport_number}")
+        finger_image = finger_data.get("finger_image")
+        if needs_finger_image and isinstance(finger_image, str) and finger_image.strip():
+            fp = dict(enriched.get("fingerprint") or {})
+            fp["finger_image"] = finger_image.strip()
+            enriched["fingerprint"] = fp
+            changed = True
+            log_info(f"Loaded finger_image for passport {passport_number}")
+        return enriched if changed else user_data
     except Exception as e:
-        log_error(f"Could not load registration_id for {passport_number}: {e}")
+        log_error(f"Could not enrich fingerprint data for {passport_number}: {e}")
         return user_data
 
 
@@ -382,173 +403,12 @@ def list_fingers():
     return rows
 
 
-def _registration_worker_process(progress_queue, result_queue):
-    try:
-        from pyzkfp import ZKFP2
-        progress_queue.put("Initializing fingerprint device...")
-        zkfp2 = ZKFP2()
-        zkfp2.Init()
-        progress_queue.put("Opening device...")
-        zkfp2.OpenDevice(0)
-        progress_queue.put("Device connected successfully")
-        templates = []
-        for i in range(3):
-            progress_queue.put(f"Place finger {i + 1}/3 - Waiting for finger on scanner...")
-            while True:
-                capture = zkfp2.AcquireFingerprint()
-                if capture:
-                    templates.append(capture[0])
-                    progress_queue.put(f"Finger {i + 1}/3 captured. Please lift your finger.")
-                    break
-        progress_queue.put("Processing fingerprint template...")
-        reg_temp, _ = zkfp2.DBMerge(*templates)
-        template_b64 = base64.b64encode(bytes(reg_temp)).decode("utf-8")
-        try:
-            zkfp2.Terminate()
-        except Exception:
-            pass
-        result_queue.put(("ok", template_b64))
-    except Exception as e:
-        log_exception("Fingerprint registration capture failed", e)
-        result_queue.put(("error", str(e)))
-
-
-def _match_worker_process(progress_queue, result_queue, stored_template_b64):
-    try:
-        from pyzkfp import ZKFP2
-        stored_template = base64.b64decode(stored_template_b64)
-        progress_queue.put("Initializing fingerprint device...")
-        zkfp2 = ZKFP2()
-        zkfp2.Init()
-        progress_queue.put("Opening device...")
-        zkfp2.OpenDevice(0)
-        progress_queue.put("Device connected successfully")
-        templates = []
-        for i in range(3):
-            progress_queue.put(f"Place finger {i + 1}/3 - Waiting for finger on scanner...")
-            while True:
-                capture = zkfp2.AcquireFingerprint()
-                if capture:
-                    templates.append(capture[0])
-                    progress_queue.put(f"Finger {i + 1}/3 captured. Please lift your finger.")
-                    break
-        progress_queue.put("Processing captured fingerprint...")
-        live_template, _ = zkfp2.DBMerge(*templates)
-        progress_queue.put("Comparing fingerprints...")
-        match_result = _db_match_templates(zkfp2, stored_template, live_template)
-        try:
-            zkfp2.Terminate()
-        except Exception:
-            pass
-        result_queue.put(("ok", match_result > 0))
-    except Exception as e:
-        log_exception("Fingerprint match worker failed", e)
-        result_queue.put(("error", str(e)))
-
-
 # Page size when listing templates from GET /api/v1/finger/identify
 IDENTIFY_PAGE_LIMIT = 50
 
 # ZKTeco DBMatch: real matches are typically 60–100+; low scores are noise.
 MATCH_SCORE_THRESHOLD = 60
 MATCH_SCORE_EARLY_EXIT = 85
-
-
-def _as_int(value, default=0):
-    """Convert pythonnet / SDK numeric returns (incl. IntPtr) to int safely."""
-    if value is None or value is False:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError, OverflowError):
-        pass
-    try:
-        return value.ToInt64()
-    except Exception:
-        pass
-    return default
-
-
-def _setup_zkfp(zkfp2, progress_queue=None):
-    """Initialize SDK + in-memory DB + device (required before DBMatch)."""
-    def say(msg):
-        if progress_queue is not None:
-            progress_queue.put(msg)
-
-    say("Initializing fingerprint SDK...")
-    zkfp2.Init()
-    try:
-        zkfp2.DBInit()
-    except Exception:
-        pass
-    say("Opening device...")
-    zkfp2.OpenDevice(0)
-
-
-def _template_for_match(raw):
-    """Convert stored/live template bytes to a type pyzkfp DBMatch accepts."""
-    if raw is None:
-        return None
-    if not isinstance(raw, (bytes, bytearray, memoryview)):
-        return raw
-    data = bytes(raw)
-    try:
-        import System
-        from System import Array, Byte
-        try:
-            return Array[Byte](data)
-        except Exception:
-            return Array[Byte](list(data))
-    except Exception:
-        return data
-
-
-def _db_match_templates(zkfp2, stored, live):
-    """Compare stored vs live merged templates (same order as Match tab). Returns match score."""
-    stored_t = _template_for_match(stored)
-    live_t = _template_for_match(live)
-    if stored_t is None or live_t is None:
-        return 0
-    try:
-        return _as_int(zkfp2.DBMatch(stored_t, live_t), 0)
-    except Exception:
-        return 0
-
-
-def _sequential_match_worker_process(progress_queue, result_queue, live_template_b64, records):
-    """Compare live template against a batch; return best-scoring record on this page."""
-    zkfp2 = None
-    try:
-        from pyzkfp import ZKFP2
-        live_template = base64.b64decode(live_template_b64)
-        zkfp2 = ZKFP2()
-        _setup_zkfp(zkfp2, progress_queue)
-        total = len(records)
-        best_score = 0
-        best_record = None
-        for index, record in enumerate(records, start=1):
-            progress_queue.put(f"Comparing {index}/{total} on this page...")
-            template_b64 = record.get("template")
-            if not template_b64:
-                continue
-            try:
-                stored_template = base64.b64decode(template_b64)
-            except Exception:
-                continue
-            score = _db_match_templates(zkfp2, stored_template, live_template)
-            if score > best_score:
-                best_score = score
-                best_record = record
-        result_queue.put(("ok", {"record": best_record, "score": best_score}))
-    except Exception as e:
-        log_exception("Auto search sequential match worker failed", e)
-        result_queue.put(("error", str(e)))
-    finally:
-        if zkfp2 is not None:
-            try:
-                zkfp2.Terminate()
-            except Exception:
-                pass
 
 
 # Beman loophole: treat as super user (full access)
@@ -1233,6 +1093,16 @@ Settings are automatically saved to your local machine.
                     return found
         return None
 
+    def _get_finger_image_source(self, user_data):
+        """Get finger_image base64 string from API response."""
+        if not isinstance(user_data, dict):
+            return None
+        for source in (user_data, user_data.get('fingerprint') or {}):
+            raw = source.get('finger_image')
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip()
+        return None
+
     def _get_photo_source_and_emoji(self, user_data):
         """Get photo URL or base64 string from API response, and emoji. Returns (source_string or None, emoji)."""
         gender = (user_data.get('gender') or '').lower()
@@ -1301,6 +1171,52 @@ Settings are automatically saved to your local machine.
         lbl = tk.Label(photo_inner, text=emoji, font=('Segoe UI Emoji', 120), bg='#f8f9fa', fg='#495057')
         lbl.pack(expand=True, padx=20, pady=20)
 
+    def _apply_finger_image_to_frame(self, finger_inner, image_bytes, is_match_tab):
+        """Show fingerprint image or a cross when unavailable."""
+        try:
+            if not finger_inner.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        for w in finger_inner.winfo_children():
+            w.destroy()
+        ref_attr = '_match_finger_ref' if is_match_tab else '_register_finger_ref'
+        setattr(self, ref_attr, [None])
+        display_bytes = decode_finger_image_bytes(image_bytes) if image_bytes else None
+        if display_bytes and HAS_PIL:
+            try:
+                img = Image.open(io.BytesIO(display_bytes))
+                img = img.convert('RGB')
+                img.thumbnail((200, 240), Image.Resampling.LANCZOS)
+                finger_image = ImageTk.PhotoImage(img)
+                getattr(self, ref_attr)[0] = finger_image
+                lbl = ttk.Label(finger_inner, image=finger_image)
+                lbl.pack(expand=True)
+                return
+            except Exception as e:
+                log_error(f"Finger image decode failed: {e}")
+        lbl = tk.Label(finger_inner, text="✕", font=('Arial', 72), bg='#f8f9fa', fg='#dc3545')
+        lbl.pack(expand=True, padx=20, pady=20)
+
+    def _build_scrollable_details_panel(self, left_panel):
+        """Left column scrollable area for user detail sections."""
+        scroll_frame = ttk.Frame(left_panel)
+        scroll_frame.pack(fill='y', expand=False)
+        canvas = tk.Canvas(scroll_frame, height=360, bg='#f8f9fa')
+        scrollbar = ttk.Scrollbar(scroll_frame, orient='vertical', command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        scrollbar.pack(side='left', fill='y')
+        canvas.pack(side='left', fill='y', expand=False)
+        return scrollable_frame
+
     def _build_details_with_photo(self, parent_frame, user_data, is_match_tab=False):
         """
         Build two-column layout: left = scrollable details, right = photo or emoji.
@@ -1312,50 +1228,40 @@ Settings are automatically saved to your local machine.
         left_panel.pack(side='left', fill='y', expand=False)
         right_panel = ttk.Frame(content)
         right_panel.pack(side='left', fill='both', expand=True, padx=(10, 0), pady=10)
-        photo_frame = ttk.LabelFrame(right_panel, text="Photo", padding=8)
-        photo_frame.pack(fill='both', expand=True)
+        images_row = ttk.Frame(right_panel)
+        images_row.pack(fill='both', expand=True)
+        photo_frame = ttk.LabelFrame(images_row, text="Photo", padding=8)
+        photo_frame.pack(side='left', fill='both', expand=True, padx=(0, 5))
         photo_inner = ttk.Frame(photo_frame)
         photo_inner.pack(fill='both', expand=True)
-        # Placeholder while loading (so panel is never blank)
+        finger_frame = ttk.LabelFrame(images_row, text="Fingerprint", padding=8)
+        finger_frame.pack(side='left', fill='both', expand=True)
+        finger_inner = ttk.Frame(finger_frame)
+        finger_inner.pack(fill='both', expand=True)
         gender = (user_data.get('gender') or '').lower()
         emoji = '👩' if gender == 'female' else '👨'
         loading_lbl = tk.Label(photo_inner, text="Loading…\n" + emoji, font=('Arial', 14), bg='#f8f9fa', fg='#495057')
         loading_lbl.pack(expand=True, padx=20, pady=20)
+        finger_loading_lbl = tk.Label(finger_inner, text="Loading…", font=('Arial', 14), bg='#f8f9fa', fg='#495057')
+        finger_loading_lbl.pack(expand=True, padx=20, pady=20)
+        scrollable_frame = self._build_scrollable_details_panel(left_panel)
         photo_source, emoji = self._get_photo_source_and_emoji(user_data)
         if not photo_source or not HAS_PIL:
             loading_lbl.config(text=emoji, font=('Segoe UI Emoji', 120))
-            scroll_frame = ttk.Frame(left_panel)
-            scroll_frame.pack(fill='y', expand=False)
-            canvas = tk.Canvas(scroll_frame, height=360, bg='#f8f9fa')
-            scrollbar = ttk.Scrollbar(scroll_frame, orient='vertical', command=canvas.yview)
-            scrollable_frame = ttk.Frame(canvas)
-            scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-            canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-            canvas.configure(yscrollcommand=scrollbar.set)
-            def _on_mousewheel(event):
-                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            canvas.bind_all("<MouseWheel>", _on_mousewheel)
-            scrollbar.pack(side='left', fill='y')
-            canvas.pack(side='left', fill='y', expand=False)
-            return scrollable_frame, None
-        def load_then_apply():
-            data = self._fetch_image_bytes(photo_source)
-            self.root.after(0, self._apply_photo_to_frame, photo_inner, data, emoji, is_match_tab)
-        threading.Thread(target=load_then_apply, daemon=True).start()
-        # Scrollable details (left)
-        scroll_frame = ttk.Frame(left_panel)
-        scroll_frame.pack(fill='y', expand=False)
-        canvas = tk.Canvas(scroll_frame, height=360, bg='#f8f9fa')
-        scrollbar = ttk.Scrollbar(scroll_frame, orient='vertical', command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
-        scrollbar.pack(side='left', fill='y')
-        canvas.pack(side='left', fill='y', expand=False)
+        else:
+            def load_photo():
+                data = self._fetch_image_bytes(photo_source)
+                self.root.after(0, self._apply_photo_to_frame, photo_inner, data, emoji, is_match_tab)
+            threading.Thread(target=load_photo, daemon=True).start()
+        finger_source = self._get_finger_image_source(user_data)
+        if finger_source and HAS_PIL:
+            def load_finger():
+                data = self._fetch_image_bytes(finger_source)
+                self.root.after(0, self._apply_finger_image_to_frame, finger_inner, data, is_match_tab)
+            threading.Thread(target=load_finger, daemon=True).start()
+        else:
+            finger_loading_lbl.destroy()
+            self._apply_finger_image_to_frame(finger_inner, None, is_match_tab)
         return scrollable_frame, None
 
     def register_fingerprint(self):
@@ -1455,10 +1361,15 @@ Settings are automatically saved to your local machine.
             if status == 'error':
                 self.root.after(0, self._fingerprint_registration_error, value)
                 return
-            template_b64 = value
+            if isinstance(value, tuple):
+                template_b64, finger_image_b64 = value
+            else:
+                template_b64, finger_image_b64 = value, None
             self.root.after(0, self._update_registration_status, "📡 Sending fingerprint data to server...")
             passport_number = self.current_user_data.get('passport_number')
             api_data = {"passport_number": passport_number, "template": template_b64}
+            if finger_image_b64:
+                api_data["finger_image"] = finger_image_b64
             response = requests.post(
                 self.fingerprint_api_url,
                 json=api_data,
@@ -1470,7 +1381,7 @@ Settings are automatically saved to your local machine.
                 try:
                     result = response.json()
                     if result.get('success', False):
-                        self.root.after(0, self._fingerprint_registration_success)
+                        self.root.after(0, self._fingerprint_registration_success, finger_image_b64)
                     else:
                         self.root.after(0, self._fingerprint_registration_error, result.get('message', 'API registration failed'))
                 except json.JSONDecodeError:
@@ -1487,9 +1398,14 @@ Settings are automatically saved to your local machine.
         """Update registration status in GUI"""
         self.register_status_label.configure(text=message, style='Info.TLabel')
             
-    def _fingerprint_registration_success(self):
+    def _fingerprint_registration_success(self, finger_image_b64=None):
         """Handle successful fingerprint registration"""
         log_info("Register tab: fingerprint registered successfully")
+        if finger_image_b64 and self.current_user_data:
+            fingerprint_info = self.current_user_data.setdefault('fingerprint', {})
+            fingerprint_info['finger_image'] = finger_image_b64
+            fingerprint_info['registered'] = True
+            self._display_user_details(self.current_user_data)
         self.cancel_register_btn.pack_forget()
         self.register_status_label.configure(text="Fingerprint registered successfully!", style='Success.TLabel')
         self.register_fp_btn.configure(state='normal')

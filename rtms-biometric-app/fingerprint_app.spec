@@ -24,6 +24,7 @@ a = Analysis(
     datas=[("app_settings.json", ".")],
     hiddenimports=[
         "lib",
+        "fingerprint_workers",
         "tkinter",
         "tkinter.ttk",
         "requests",
