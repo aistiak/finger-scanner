@@ -23,6 +23,7 @@ except ImportError:
 from fingerprint_workers import (
     decode_finger_image_bytes,
     _registration_worker_process,
+    _capture_worker_process,
     _match_worker_process,
     _sequential_match_worker_process,
 )
@@ -1910,7 +1911,7 @@ Settings are automatically saved to your local machine.
             progress_queue = multiprocessing.Queue()
             result_queue = multiprocessing.Queue()
             p = multiprocessing.Process(
-                target=_registration_worker_process,
+                target=_capture_worker_process,
                 args=(progress_queue, result_queue),
             )
             self._auto_search_process = p

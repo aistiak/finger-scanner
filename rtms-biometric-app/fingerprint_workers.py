@@ -195,6 +195,37 @@ def _registration_worker_process(progress_queue, result_queue):
         result_queue.put(("error", str(e)))
 
 
+def _capture_worker_process(progress_queue, result_queue):
+    """
+    Capture a single fingerprint template.
+    result_queue: ('ok', template_b64) or ('error', message).
+    """
+    zkfp2 = None
+    try:
+        from pyzkfp import ZKFP2
+        zkfp2 = ZKFP2()
+        _setup_zkfp(zkfp2, progress_queue)
+        progress_queue.put("Place finger on scanner...")
+        live_template = None
+        while True:
+            capture = zkfp2.AcquireFingerprint()
+            template, _ = _normalize_capture(capture)
+            if template:
+                live_template = template
+                progress_queue.put("Fingerprint captured.")
+                break
+        template_b64 = base64.b64encode(bytes(live_template)).decode("utf-8")
+        result_queue.put(("ok", template_b64))
+    except Exception as e:
+        result_queue.put(("error", str(e)))
+    finally:
+        if zkfp2 is not None:
+            try:
+                zkfp2.Terminate()
+            except Exception:
+                pass
+
+
 def _match_worker_process(progress_queue, result_queue, stored_template_b64):
     """
     Run in a separate process so device handles are fully released when process exits.
@@ -205,23 +236,17 @@ def _match_worker_process(progress_queue, result_queue, stored_template_b64):
         stored_template = base64.b64decode(stored_template_b64)
         progress_queue.put("Initializing fingerprint device...")
         zkfp2 = ZKFP2()
-        zkfp2.Init()
-        progress_queue.put("Opening device...")
-        zkfp2.OpenDevice(0)
+        _setup_zkfp(zkfp2, progress_queue)
         progress_queue.put("Device connected successfully")
-        templates = []
-        for i in range(3):
-            progress_queue.put(f"Place finger {i + 1}/3 - Waiting for finger on scanner...")
-            while True:
-                capture = zkfp2.AcquireFingerprint()
-                template, _ = _normalize_capture(capture)
-                if template:
-                    templates.append(template)
-                    progress_queue.put(f"Finger {i + 1}/3 captured. Please lift your finger.")
-                    break
-        progress_queue.put("Processing captured fingerprint...")
-        live_template, _ = zkfp2.DBMerge(*templates)
-        progress_queue.put("Comparing fingerprints...")
+        progress_queue.put("Place finger on scanner...")
+        live_template = None
+        while True:
+            capture = zkfp2.AcquireFingerprint()
+            template, _ = _normalize_capture(capture)
+            if template:
+                live_template = template
+                progress_queue.put("Fingerprint captured. Comparing...")
+                break
         match_result = _db_match_templates(zkfp2, stored_template, live_template)
         try:
             zkfp2.Terminate()
