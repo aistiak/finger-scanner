@@ -27,6 +27,10 @@ from fingerprint_workers import (
     _match_worker_process,
     _sequential_match_worker_process,
 )
+from barcode_print import (
+    print_barcode_async,
+    resolve_printable_serial,
+)
 
 
 def app_dir():
@@ -191,18 +195,8 @@ def extract_login_user_info(data):
 
 
 def resolve_registration_id(user_data):
-    """Read registration ID from user or match API payload (not passport_number)."""
-    if not isinstance(user_data, dict):
-        return None
-    id_keys = ("registration_id", "registration_number")
-    for source in (user_data, user_data.get("fingerprint") or {}):
-        if not isinstance(source, dict):
-            continue
-        for key in id_keys:
-            value = source.get(key)
-            if value is not None and str(value).strip():
-                return str(value).strip()
-    return None
+    """Read printable serial from API payload (registration_id / daily_serial_no)."""
+    return resolve_printable_serial(user_data)
 
 
 def enrich_user_data_with_registration_id(user_data, fingerprint_lookup_url, auth_token=None):
@@ -630,6 +624,7 @@ class LoginScreen:
 
 
 FRONTDESK_ROLE = "frontdesk"
+PHLEBOTOMIST_ROLE = "phlebotomist"
 
 def _can_register(user_info):
     """True if user can register fingerprint: super_admin, beman loophole, or frontdesk."""
@@ -653,6 +648,14 @@ def _can_match(user_info):
     return role != FRONTDESK_ROLE
 
 
+def _can_print_barcode(user_info):
+    """True if user can print sample barcodes (phlebotomist only)."""
+    if not user_info:
+        return False
+    role = (user_info.get("role") or "").strip().lower()
+    return role == PHLEBOTOMIST_ROLE
+
+
 class FingerprintApp:
     def __init__(self, root, auth_token=None, user_info=None, on_logout=None):
         self.root = root
@@ -665,6 +668,9 @@ class FingerprintApp:
         self.root.configure(bg='#f0f0f0')
         self.can_register = _can_register(user_info)
         self.can_match = _can_match(user_info)
+        self.can_print_barcode = _can_print_barcode(user_info)
+        self._last_auto_printed_serial = None
+        self.auto_print_var = None  # set after settings load for phlebotomist
         
         # Initialize database
         init_db()
@@ -702,6 +708,11 @@ class FingerprintApp:
         self.fingerprint_lookup_url = server_url + "/api/v1/finger/passport"
         self.fingerprint_identify_url = server_url + "/api/v1/finger/identify"
         self.login_url_base = server_url.rstrip('/')  # for logout
+
+        if self.can_print_barcode:
+            self.auto_print_var = tk.BooleanVar(
+                value=bool(self.settings.get("auto_print_barcode", False))
+            )
 
         # Create tabs: Register/Match by role; Auto Search + Settings for everyone
         if self.can_register:
@@ -823,6 +834,18 @@ class FingerprintApp:
         self.cancel_match_btn = ttk.Button(row1, text="Cancel", command=self._cancel_match)
         self.cancel_match_btn.pack(side='left')
         self.cancel_match_btn.pack_forget()
+        if self.can_print_barcode:
+            self.match_print_barcode_btn = ttk.Button(
+                row1, text="Print Barcode", command=self._print_match_barcode
+            )
+            self.match_print_barcode_btn.pack(side='left', padx=(15, 0))
+            self.match_auto_print_cb = ttk.Checkbutton(
+                row1,
+                text="Auto Print",
+                variable=self.auto_print_var,
+                command=self._on_auto_print_toggled,
+            )
+            self.match_auto_print_cb.pack(side='left', padx=(10, 0))
         self.match_loading_label = ttk.Label(top_frame, text="", style='Info.TLabel')
         self.match_loading_label.pack(anchor='w', pady=(6, 0))
         self.match_result_label = ttk.Label(top_frame, text="", style='Info.TLabel')
@@ -856,6 +879,18 @@ class FingerprintApp:
         self.cancel_auto_search_btn = ttk.Button(row1, text="Cancel", command=self._cancel_auto_search)
         self.cancel_auto_search_btn.pack(side='left')
         self.cancel_auto_search_btn.pack_forget()
+        if self.can_print_barcode:
+            self.auto_search_print_barcode_btn = ttk.Button(
+                row1, text="Print Barcode", command=self._print_auto_search_barcode
+            )
+            self.auto_search_print_barcode_btn.pack(side='left', padx=(15, 0))
+            self.auto_search_auto_print_cb = ttk.Checkbutton(
+                row1,
+                text="Auto Print",
+                variable=self.auto_print_var,
+                command=self._on_auto_print_toggled,
+            )
+            self.auto_search_auto_print_cb.pack(side='left', padx=(10, 0))
         self.auto_search_status_label = ttk.Label(top_frame, text="Place finger on scanner to search by fingerprint.", style='Info.TLabel')
         self.auto_search_status_label.pack(anchor='w', pady=(8, 0))
         
@@ -1478,6 +1513,100 @@ Settings are automatically saved to your local machine.
         self.register_fp_btn.configure(state='normal')
         messagebox.showerror("Error", f"Fingerprint registration failed: {error_message}")
         
+    def _on_auto_print_toggled(self):
+        """Persist Auto Print checkbox across sessions."""
+        if not self.can_print_barcode or self.auto_print_var is None:
+            return
+        self.settings["auto_print_barcode"] = bool(self.auto_print_var.get())
+        if self.save_settings_to_file(self.settings):
+            log_info(f"Auto Print preference saved: {self.settings['auto_print_barcode']}")
+        else:
+            log_error("Failed to save Auto Print preference")
+
+    def _set_print_status(self, status_label, message, style="Info.TLabel"):
+        if status_label is not None:
+            try:
+                status_label.configure(text=message, style=style)
+            except Exception:
+                pass
+
+    def _print_barcode_for_user(self, user_data, *, auto=False, status_label=None):
+        """Print Code128 of the patient's printable serial (non-blocking)."""
+        if not self.can_print_barcode:
+            return
+        serial = resolve_registration_id(user_data)
+        if not serial:
+            msg = "No printable serial (registration_id / daily_serial_no) available."
+            log_error(f"Barcode print: {msg}")
+            self._set_print_status(status_label, f"❌ {msg}", "Error.TLabel")
+            if not auto:
+                messagebox.showerror("Print Barcode", msg)
+            return
+
+        if auto and serial == self._last_auto_printed_serial:
+            log_info(f"Auto Print skipped (already printed for {serial})")
+            return
+
+        self._set_print_status(
+            status_label,
+            f"Printing barcode ({serial})...",
+            "Info.TLabel",
+        )
+        log_info(f"Barcode print {'(auto)' if auto else '(manual)'}: {serial}")
+
+        def on_done(ok, status, detail):
+            def apply():
+                if ok:
+                    if auto:
+                        self._last_auto_printed_serial = serial
+                    style = "Success.TLabel"
+                    prefix = "✅"
+                    if status == "opened":
+                        prefix = "ℹ️"
+                    self._set_print_status(status_label, f"{prefix} {detail}", style)
+                    log_info(f"Barcode print result: {detail}")
+                else:
+                    self._set_print_status(status_label, f"❌ {detail}", "Error.TLabel")
+                    log_error(f"Barcode print failed: {detail}")
+                    if not auto:
+                        messagebox.showerror("Print Barcode", detail)
+
+            self.root.after(0, apply)
+
+        print_barcode_async(serial, prefer_silent=True, on_done=on_done)
+
+    def _maybe_auto_print(self, user_data, status_label=None):
+        """Auto-print after match/selection when Auto Print is enabled."""
+        if not self.can_print_barcode or self.auto_print_var is None:
+            return
+        if not self.auto_print_var.get():
+            return
+        if not user_data:
+            return
+        self._print_barcode_for_user(user_data, auto=True, status_label=status_label)
+
+    def _print_match_barcode(self):
+        """Manual Print Barcode on Match tab."""
+        if not self.current_match_user_data:
+            messagebox.showerror("Print Barcode", "Please search for a patient first.")
+            return
+        self._print_barcode_for_user(
+            self.current_match_user_data,
+            auto=False,
+            status_label=self.match_result_label,
+        )
+
+    def _print_auto_search_barcode(self):
+        """Manual Print Barcode on Auto Search tab."""
+        if not self.current_auto_search_user_data:
+            messagebox.showerror("Print Barcode", "Please identify a patient first.")
+            return
+        self._print_barcode_for_user(
+            self.current_auto_search_user_data,
+            auto=False,
+            status_label=self.auto_search_status_label,
+        )
+
     def match_fingerprint(self):
         """Match fingerprint with stored template"""
         if not self.current_match_user_data:
@@ -1634,6 +1763,10 @@ Settings are automatically saved to your local machine.
             self.match_result_label.configure(text="✅ Match successful", 
                                             style='MatchSuccess.TLabel')
             messagebox.showinfo("Match Success", "Fingerprint matched successfully")
+            self._maybe_auto_print(
+                self.current_match_user_data,
+                status_label=self.match_result_label,
+            )
         else:
             self.match_result_label.configure(text="❌ Does not match", 
                                             style='MatchNoMatch.TLabel')
@@ -1823,9 +1956,14 @@ Settings are automatically saved to your local machine.
                 data = response.json()
                 if data.get('success'):
                     self.current_match_user_data = enriched_user_data if enriched_user_data is not None else data.get('data')
+                    self._last_auto_printed_serial = None  # new patient selection
                     self._display_match_user_details(self.current_match_user_data)
                     self.match_loading_label.configure(text="User found successfully!", style='Success.TLabel')
                     log_info(f"Match tab: user found {passport_number}")
+                    self._maybe_auto_print(
+                        self.current_match_user_data,
+                        status_label=self.match_result_label,
+                    )
                 else:
                     self._handle_match_api_error(data.get('message', 'Unknown error'))
             else:
@@ -1845,6 +1983,7 @@ Settings are automatically saved to your local machine.
         self.match_search_btn.configure(state='normal')
         self.match_details_frame.pack_forget()
         self.current_match_user_data = None
+        self._last_auto_printed_serial = None
         
     def _display_match_user_details(self, user_data):
         """Display user details with left (details) and right (photo/emoji) layout"""
@@ -1867,6 +2006,7 @@ Settings are automatically saved to your local machine.
         )
         self.auto_search_details_frame.pack_forget()
         self.current_auto_search_user_data = None
+        self._last_auto_printed_serial = None
         log_info("Auto Search: started")
         thread = threading.Thread(target=self._auto_search_thread)
         thread.daemon = True
@@ -2149,6 +2289,10 @@ Settings are automatically saved to your local machine.
             style='Success.TLabel',
         )
         messagebox.showinfo("Auto Search", f"User identified: {name}{score_text}")
+        self._maybe_auto_print(
+            self.current_auto_search_user_data,
+            status_label=self.auto_search_status_label,
+        )
 
     def _handle_auto_search_error(self, error_message):
         if error_message and "No matching fingerprint" in str(error_message):
@@ -2160,6 +2304,7 @@ Settings are automatically saved to your local machine.
         self.auto_search_status_label.configure(text=f"Error: {error_message}", style='Error.TLabel')
         self.auto_search_details_frame.pack_forget()
         self.current_auto_search_user_data = None
+        self._last_auto_printed_serial = None
         if error_message and "No matching fingerprint" not in str(error_message):
             messagebox.showerror("Auto Search", str(error_message))
         else:
