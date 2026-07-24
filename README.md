@@ -86,6 +86,7 @@ Base URL comes from **Settings** (`server_url`), e.g. `http://rtmsbd.com`:
 | POST | `/api/v1/fingerprint/register` |
 | GET | `/api/v1/finger/passport/{passport_number}` |
 | GET | `/api/v1/finger/identify?limit=&page=` (template list for auto search) |
+| POST | `/api/v1/finger-scan/history` (action audit: login/logout/add/scan/match/search/update) |
 
 ## Troubleshooting
 
