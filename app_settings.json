@@ -1,12 +1,15 @@
 {
   "server_url": "https://rtmsbd.com",
-  "last_updated": "2026-07-25T00:24:49.727755",
+  "last_updated": "2026-07-25T00:30:31.919003",
+  "branch_id": 37,
   "remembered_user": {
     "name": "sample collector test",
     "email": "sample@gmail.com",
     "phone_number": "",
     "role": "phlebotomist",
-    "branch_id": 37
-  },
-  "branch_id": 37
+    "branch_id": 37,
+    "remember_me": true,
+    "token": "tnh8OcdYyZN2tfVsSVqC7eJ9yuMUw02M5QTM7Vvcvhjgz9bKJWwXnm1ypUbT",
+    "token_expires_at": "2026-07-26 00:30:26"
+  }
 }

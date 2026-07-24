@@ -304,21 +304,62 @@ def load_remembered_user():
     return {}
 
 
-def remember_user_info(user_info):
-    """Persist user details locally (token is not stored)."""
+def load_saved_session():
+    """
+    Return (token, user_info) if Remember me session exists and can restore login.
+    Otherwise return None.
+    """
+    remembered = load_remembered_user()
+    if not remembered.get("remember_me"):
+        return None
+    email = (remembered.get("email") or "").strip()
+    if not email and not remembered.get("_beman_loophole"):
+        return None
+    user_info = {
+        "name": remembered.get("name") or (email.split("@")[0] if email else "User"),
+        "email": email,
+        "phone_number": remembered.get("phone_number") or "",
+        "role": (remembered.get("role") or "user").strip().lower(),
+        "branch_id": normalize_branch_id(remembered.get("branch_id")),
+        "token": remembered.get("token"),
+        "token_expires_at": remembered.get("token_expires_at"),
+    }
+    if remembered.get("_beman_loophole"):
+        user_info["_beman_loophole"] = True
+        user_info["role"] = "super_admin"
+    if remembered.get("_login_without_token"):
+        user_info["_login_without_token"] = True
+    token = user_info.get("token")
+    # Beman / no-token sessions are valid without a token; API sessions need one.
+    if not token and not user_info.get("_beman_loophole") and not user_info.get("_login_without_token"):
+        return None
+    return token, user_info
+
+
+def remember_user_info(user_info, remember_me=False):
+    """Persist user details locally. When remember_me is True, also store the auth token."""
     try:
         settings = {}
         if os.path.exists(settings_path()):
             with open(settings_path(), "r", encoding="utf-8") as f:
                 settings = json.load(f)
         branch_id = normalize_branch_id(user_info.get("branch_id"))
-        settings["remembered_user"] = {
+        payload = {
             "name": user_info.get("name") or "",
             "email": user_info.get("email") or "",
             "phone_number": user_info.get("phone_number") or "",
             "role": user_info.get("role") or "",
             "branch_id": branch_id,
+            "remember_me": bool(remember_me),
         }
+        if remember_me:
+            payload["token"] = user_info.get("token")
+            payload["token_expires_at"] = user_info.get("token_expires_at")
+            if user_info.get("_beman_loophole"):
+                payload["_beman_loophole"] = True
+            if user_info.get("_login_without_token"):
+                payload["_login_without_token"] = True
+        settings["remembered_user"] = payload
         if branch_id is not None:
             settings["branch_id"] = branch_id
         settings["last_updated"] = datetime.now().isoformat()
@@ -446,7 +487,7 @@ class LoginScreen:
 
     def _build_ui(self):
         self.root.title("RTMS Biometric system – Login")
-        self.root.geometry("420x320")
+        self.root.geometry("420x360")
         self.root.configure(bg='#f0f0f0')
         ttk.Style().configure('TLabel', background='#f0f0f0')
         title = ttk.Label(self.frame, text="Login", font=('Arial', 18, 'bold'))
@@ -464,8 +505,15 @@ class LoginScreen:
         ttk.Label(self.frame, text="Password").pack(anchor='w')
         self.password_var = tk.StringVar()
         pass_entry = ttk.Entry(self.frame, textvariable=self.password_var, width=35, show='•', font=('Arial', 11))
-        pass_entry.pack(fill='x', pady=(2, 20))
+        pass_entry.pack(fill='x', pady=(2, 12))
         pass_entry.bind('<Return>', lambda e: self._do_login())
+        # Remember me
+        self.remember_me_var = tk.BooleanVar(value=bool(remembered.get("remember_me")))
+        ttk.Checkbutton(
+            self.frame,
+            text="Remember me",
+            variable=self.remember_me_var,
+        ).pack(anchor='w', pady=(0, 16))
         # Buttons
         btn_frame = ttk.Frame(self.frame)
         btn_frame.pack(fill='x', pady=(0, 8))
@@ -473,6 +521,14 @@ class LoginScreen:
         self.login_btn.pack(side='left', padx=(0, 10))
         self.status_label = ttk.Label(self.frame, text="", foreground='#c00')
         self.status_label.pack(anchor='w', pady=(4, 0))
+
+    def _persist_login_session(self, user_info):
+        """Save or clear session based on Remember me checkbox."""
+        if self.remember_me_var.get():
+            remember_user_info(user_info, remember_me=True)
+            persist_branch_id(user_info.get("branch_id"))
+        else:
+            clear_remembered_user_settings()
 
     def _do_login(self):
         email = (self.email_var.get() or "").strip()
@@ -495,6 +551,7 @@ class LoginScreen:
                 "token_expires_at": None,
                 "_beman_loophole": True,
             }
+            self._persist_login_session(user_info)
             self.on_success(None, user_info)
             return
         self.login_btn.configure(state='disabled')
@@ -539,19 +596,19 @@ class LoginScreen:
                 user_info = extract_login_user_info(data)
                 if not user_info.get("email"):
                     user_info["email"] = email
-                remember_user_info(user_info)
-                persist_branch_id(user_info.get("branch_id"))
+                self._persist_login_session(user_info)
                 log_info(
                     f"Login success: {user_info.get('email')} role={user_info.get('role')} "
                     f"branch_id={user_info.get('branch_id')} "
-                    f"token={'yes' if user_info.get('token') else 'no'}"
+                    f"token={'yes' if user_info.get('token') else 'no'} "
+                    f"remember_me={self.remember_me_var.get()}"
                 )
                 self.status_label.configure(text="")
                 self.on_success(user_info.get("token"), user_info)
                 return
             if is_auth_ok_token_save_failed(data, response):
                 user_info = user_info_without_token(email, load_remembered_user())
-                remember_user_info(user_info)
+                self._persist_login_session(user_info)
                 log_info(
                     f"Login: valid credentials for {email}, continuing without API token "
                     f"(role={user_info.get('role')})"
@@ -2124,13 +2181,13 @@ def run_app():
     install_global_exception_logger()
     log_info(f"=== RTMS Biometric System started (log file: {logs_path()}) ===")
     root = tk.Tk()
-    root.geometry("420x320")
+    root.geometry("420x360")
     root.configure(bg="#f0f0f0")
 
     def show_login():
         for w in root.winfo_children():
             w.destroy()
-        root.geometry("420x320")
+        root.geometry("420x360")
         LoginScreen(root, on_success=on_login_success)
 
     def on_login_success(token, user_info):
@@ -2139,5 +2196,14 @@ def run_app():
         root.geometry("1100x850")
         FingerprintApp(root, auth_token=token, user_info=user_info, on_logout=show_login)
 
-    show_login()
+    saved = load_saved_session()
+    if saved:
+        token, user_info = saved
+        log_info(
+            f"Restored Remember me session: {user_info.get('email')} "
+            f"role={user_info.get('role')}"
+        )
+        on_login_success(token, user_info)
+    else:
+        show_login()
     root.mainloop()
