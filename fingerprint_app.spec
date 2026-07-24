@@ -4,52 +4,47 @@ import site
 
 block_cipher = None
 
-# Find pyzkfp package location
 pyzkfp_path = None
 for path in site.getsitepackages():
-    potential_path = os.path.join(path, 'pyzkfp')
+    potential_path = os.path.join(path, "pyzkfp")
     if os.path.exists(potential_path):
         pyzkfp_path = potential_path
         break
 
-# Collect ZKFP2 native libraries
 zkfp_binaries = []
 if pyzkfp_path:
     for file in os.listdir(pyzkfp_path):
-        if file.endswith(('.dll', '.so', '.dylib')):
-            zkfp_binaries.append((os.path.join(pyzkfp_path, file), '.'))
+        if file.endswith((".dll", ".so", ".dylib")):
+            zkfp_binaries.append((os.path.join(pyzkfp_path, file), "."))
 
 a = Analysis(
-    ['main.py'],
-    pathex=['.'],
+    ["main.py"],
+    pathex=["."],
     binaries=zkfp_binaries,
-    datas=[
-        ('app_settings.json', '.'),
-        ('fingerprints-1.db', '.'),
-        ('py3.py', '.'),
-    ],
+    datas=[("app_settings.json", ".")],
     hiddenimports=[
-        'tkinter',
-        'tkinter.ttk',
-        'requests',
-        'pyzkfp',
-        'pyzkfp.zkfp',
-        'json',
-        'base64',
-        'threading',
-        'datetime',
-        'sqlite3',
-        'os',
-        'sys',
-        'ctypes',
-        'ctypes.wintypes',
-        # pkg_resources / setuptools runtime hook dependencies
-        'jaraco',
-        'jaraco.text',
-        'jaraco.functools',
-        'jaraco.context',
-        'jaraco.classes',
-        'more_itertools',
+        "lib",
+        "fingerprint_workers",
+        "tkinter",
+        "tkinter.ttk",
+        "requests",
+        "pyzkfp",
+        "pyzkfp.zkfp",
+        "PIL",
+        "PIL.Image",
+        "PIL.ImageTk",
+        "json",
+        "base64",
+        "threading",
+        "datetime",
+        "sqlite3",
+        "multiprocessing",
+        "jaraco",
+        "jaraco.text",
+        "jaraco.functools",
+        "jaraco.context",
+        "jaraco.classes",
+        "more_itertools",
     ],
     hookspath=[],
     hooksconfig={},
@@ -70,9 +65,8 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='FingerprintApp',
+    name="FingerprintApp",
     debug=False,
-    icon='icon.ico',
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,

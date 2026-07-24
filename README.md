@@ -1,95 +1,99 @@
-# Fingerprint Registration Desktop Application
+# RTMS Biometric App
 
-A modern desktop application built with Tkinter for fingerprint registration and matching with passport API integration.
+Self-contained Windows desktop client for RTMS fingerprint registration, matching, and auto search.
 
-## Features
+## Layout
 
-### Register Tab
-- **Passport Search**: Enter passport number and search via API
-- **User Details Display**: Beautiful formatted display of user information
-- **Fingerprint Registration**: Capture and store fingerprints linked to passport data
+| File | Purpose |
+|------|---------|
+| `main.py` | Entry point — starts the GUI |
+| `lib.py` | Application logic (login, tabs, API, local DB helpers) |
+| `fingerprint_workers.py` | Scanner worker processes and finger-image encode/decode helpers |
+| `requirements.txt` | Python dependencies |
+| `app_settings.json` | Default server URL (created/updated at runtime next to the exe when built) |
+| `build.bat` | One-click Windows build (venv + PyInstaller) |
+| `fingerprint_app.spec` | PyInstaller configuration |
 
-### Match Tab
-- **Stored Fingerprints List**: View all registered fingerprints
-- **Fingerprint Matching**: Match live fingerprint against stored templates
-- **Real-time Results**: Instant match/no-match feedback
+Runtime files (next to `main.py` when developing, or next to `FingerprintApp.exe` when deployed):
 
-## API Integration
+- `app_settings.json` — server URL
+- `fingerprints-1.db` — local SQLite cache (settings tab info only; templates live on the API)
+- `logs.txt` — application and error logs (`[INFO]` / `[ERROR]` with timestamps)
 
-The application integrates with a passport service API:
-- **Endpoint**: `http://localhost:4111/api/v1/service-request/passport/{passport_number}`
-- **Method**: GET
-- **Response**: JSON with user details including personal info, visa details, branch, and country information
+## Prerequisites
 
-## Installation
+- Windows 10/11
+- Python 3.10+ (64-bit recommended)
+- ZKTeco / ZKFP2 fingerprint scanner drivers installed
+- Network access to your RTMS Laravel API
 
-1. Install required dependencies:
-```bash
+## Run from source
+
+```bat
+python -m venv venv
+venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-2. Ensure your fingerprint scanner is connected and drivers are installed
-
-3. Run the application:
-```bash
 python main.py
 ```
 
-## Usage
+## Build Windows executable
 
-### Registration Process
-1. Switch to "Register" tab
-2. Enter passport number in the search field
-3. Click "Search" to fetch user details from API
-4. Review the displayed user information
-5. Click "Register Fingerprint" to capture and store fingerprint
-6. Follow on-screen instructions for fingerprint capture
-
-### Matching Process
-1. Switch to "Match" tab
-2. Click "Refresh List" to see all stored fingerprints
-3. Enter the Finger ID you want to match against
-4. Click "Match Fingerprint"
-5. Place finger on scanner when prompted
-6. View match results
-
-## Technical Details
-
-- **GUI Framework**: Tkinter with ttk styling
-- **Database**: SQLite for fingerprint storage
-- **Fingerprint SDK**: pyzkfp (ZKTeco SDK wrapper)
-- **API Client**: requests library
-- **Threading**: Non-blocking UI with background operations
-
-## File Structure
-
-```
-gui/
-├── main.py              # Main application file
-├── requirements.txt     # Python dependencies
-└── README.md           # This file
+```bat
+build.bat
 ```
 
-## Dependencies
+Output:
 
-- `requests==2.32.5` - HTTP client for API calls
-- `pyzkfp==0.1.5` - Fingerprint scanner SDK
-- `pillow==11.3.0` - Image processing
-- `tkinter` - GUI framework (built-in with Python)
+- `dist\FingerprintApp.exe`
+- `dist\app_settings.json` (copied automatically after build)
 
-## Error Handling
+Distribute **both** files in the same folder. On first run, settings and `fingerprints-1.db` are read/written beside the executable.
 
-The application includes comprehensive error handling for:
-- Network connectivity issues
-- API response errors
-- Fingerprint scanner connection problems
-- Database operations
-- Invalid user inputs
+### Manual build
 
-## UI Features
+```bat
+venv\Scripts\activate
+pip install -r requirements.txt
+pyinstaller --noconfirm fingerprint_app.spec
+```
 
-- **Responsive Design**: Adapts to different screen sizes
-- **Loading Indicators**: Visual feedback during operations
-- **Scrollable Content**: Handles large amounts of user data
-- **Status Messages**: Real-time feedback with color coding
-- **Threading**: Prevents UI freezing during long operations
+## Features (by role)
+
+| Tab | Who sees it |
+|-----|-------------|
+| Register | `super_admin`, beman backdoor, `frontdesk` |
+| Match | All roles except `frontdesk` |
+| Auto Search | **All roles** |
+| Settings | **All roles** |
+
+**Auto Search** scans a fingerprint, then:
+
+1. Fetches stored templates from `GET /api/v1/finger/identify?limit=50&page=N` (paginated list).
+2. Compares your scan against each template on the client using the ZKTeco matcher (`DBMatch`), page by page, until a match is found.
+3. Loads full passport details for the matched `passport_number`.
+
+The UI shows **Searching...** with page and record progress while this runs. With ~7k enrolled prints, a worst-case search can take several minutes.
+
+## API endpoints used
+
+Base URL comes from **Settings** (`server_url`), e.g. `http://rtmsbd.com`:
+
+| Method | Path |
+|--------|------|
+| POST | `/api/v1/login` |
+| POST | `/api/v1/logout` |
+| GET | `/api/v1/service-request/passport/{passport_number}` |
+| POST | `/api/v1/fingerprint/register` |
+| GET | `/api/v1/finger/passport/{passport_number}` |
+| GET | `/api/v1/finger/identify?limit=&page=` (template list for auto search) |
+
+## Troubleshooting
+
+- **Device not found** — Install ZKFP2 drivers; close other apps using the scanner; run as administrator if needed.
+- **Build: module not found** — Activate `venv` and run `pip install -r requirements.txt` before `build.bat`.
+- **Build: Access denied** — Close `FingerprintApp.exe` if it is running, then rebuild.
+- **Identify / auto search fails** — Ensure Laravel exposes `POST /api/v1/finger/identify` and returns `success` with `passport_number` or full user `data`.
+
+## Development notes
+
+All application code lives at the repo root (`main.py`, `lib.py`, `fingerprint_workers.py`).

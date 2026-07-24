@@ -1,6 +1,6 @@
 """
-Worker functions for fingerprint registration and match.
-In a separate module so multiprocessing spawn (PyInstaller exe) can import them by name.
+Fingerprint scanner worker processes and image helpers.
+Separate module so multiprocessing spawn (PyInstaller exe) can import workers by name.
 """
 import base64
 import io
@@ -11,7 +11,6 @@ try:
 except ImportError:
     HAS_PIL = False
 
-# Common ZKTeco scanner grayscale dimensions (width x height).
 _FINGER_RAW_DIMENSIONS = ((256, 288), (256, 360), (300, 400))
 
 
@@ -97,24 +96,83 @@ def decode_finger_image_bytes(raw_bytes):
     return None
 
 
+def _as_int(value, default=0):
+    """Convert pythonnet / SDK numeric returns (incl. IntPtr) to int safely."""
+    if value is None or value is False:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    try:
+        return value.ToInt64()
+    except Exception:
+        pass
+    return default
+
+
+def _setup_zkfp(zkfp2, progress_queue=None):
+    """Initialize SDK + in-memory DB + device (required before DBMatch)."""
+    def say(msg):
+        if progress_queue is not None:
+            progress_queue.put(msg)
+
+    say("Initializing fingerprint SDK...")
+    zkfp2.Init()
+    try:
+        zkfp2.DBInit()
+    except Exception:
+        pass
+    say("Opening device...")
+    zkfp2.OpenDevice(0)
+
+
+def _template_for_match(raw):
+    """Convert stored/live template bytes to a type pyzkfp DBMatch accepts."""
+    if raw is None:
+        return None
+    if not isinstance(raw, (bytes, bytearray, memoryview)):
+        return raw
+    data = bytes(raw)
+    try:
+        from System import Array, Byte
+        try:
+            return Array[Byte](data)
+        except Exception:
+            return Array[Byte](list(data))
+    except Exception:
+        return data
+
+
+def _db_match_templates(zkfp2, stored, live):
+    """Compare stored vs live merged templates. Returns match score."""
+    stored_t = _template_for_match(stored)
+    live_t = _template_for_match(live)
+    if stored_t is None or live_t is None:
+        return 0
+    try:
+        return _as_int(zkfp2.DBMatch(stored_t, live_t), 0)
+    except Exception:
+        return 0
+
+
 def _registration_worker_process(progress_queue, result_queue):
     """
     Run in a separate process so device handles are fully released when process exits.
-    progress_queue: put progress messages (str).
-    result_queue: put ('ok', (template_b64, finger_image_b64)) or ('error', message).
+    result_queue: ('ok', (template_b64, finger_image_b64)) or ('error', message).
     """
     try:
         from pyzkfp import ZKFP2
-        progress_queue.put("🔧 Initializing fingerprint device...")
+        progress_queue.put("Initializing fingerprint device...")
         zkfp2 = ZKFP2()
         zkfp2.Init()
-        progress_queue.put("⚙️ Opening device...")
+        progress_queue.put("Opening device...")
         zkfp2.OpenDevice(0)
-        progress_queue.put("✅ Device connected successfully")
+        progress_queue.put("Device connected successfully")
         templates = []
         finger_image = None
         for i in range(3):
-            progress_queue.put(f"👆 Place finger {i+1}/3 - Waiting for finger on scanner...")
+            progress_queue.put(f"Place finger {i + 1}/3 - Waiting for finger on scanner...")
             while True:
                 capture = zkfp2.AcquireFingerprint()
                 template, image = _normalize_capture(capture)
@@ -122,9 +180,9 @@ def _registration_worker_process(progress_queue, result_queue):
                     templates.append(template)
                     if i == 0 and image:
                         finger_image = image
-                    progress_queue.put(f"✅ Finger {i+1}/3 captured successfully! Please lift your finger.")
+                    progress_queue.put(f"Finger {i + 1}/3 captured. Please lift your finger.")
                     break
-        progress_queue.put("🔄 Processing fingerprint template...")
+        progress_queue.put("Processing fingerprint template...")
         reg_temp, _ = zkfp2.DBMerge(*templates)
         template_b64 = base64.b64encode(bytes(reg_temp)).decode("utf-8")
         finger_image_b64 = _encode_finger_image_b64(finger_image, zkfp2)
@@ -137,35 +195,59 @@ def _registration_worker_process(progress_queue, result_queue):
         result_queue.put(("error", str(e)))
 
 
+def _capture_worker_process(progress_queue, result_queue):
+    """
+    Capture a single fingerprint template.
+    result_queue: ('ok', template_b64) or ('error', message).
+    """
+    zkfp2 = None
+    try:
+        from pyzkfp import ZKFP2
+        zkfp2 = ZKFP2()
+        _setup_zkfp(zkfp2, progress_queue)
+        progress_queue.put("Place finger on scanner...")
+        live_template = None
+        while True:
+            capture = zkfp2.AcquireFingerprint()
+            template, _ = _normalize_capture(capture)
+            if template:
+                live_template = template
+                progress_queue.put("Fingerprint captured.")
+                break
+        template_b64 = base64.b64encode(bytes(live_template)).decode("utf-8")
+        result_queue.put(("ok", template_b64))
+    except Exception as e:
+        result_queue.put(("error", str(e)))
+    finally:
+        if zkfp2 is not None:
+            try:
+                zkfp2.Terminate()
+            except Exception:
+                pass
+
+
 def _match_worker_process(progress_queue, result_queue, stored_template_b64):
     """
     Run in a separate process so device handles are fully released when process exits.
-    progress_queue: progress messages (str). result_queue: ('ok', True/False) or ('error', message).
-    stored_template_b64: base64 string of the stored template to match against.
+    result_queue: ('ok', True/False) or ('error', message).
     """
     try:
         from pyzkfp import ZKFP2
         stored_template = base64.b64decode(stored_template_b64)
-        progress_queue.put("🔧 Initializing fingerprint device...")
+        progress_queue.put("Initializing fingerprint device...")
         zkfp2 = ZKFP2()
-        zkfp2.Init()
-        progress_queue.put("⚙️ Opening device...")
-        zkfp2.OpenDevice(0)
-        progress_queue.put("✅ Device connected successfully")
-        templates = []
-        for i in range(3):
-            progress_queue.put(f"👆 Place finger {i+1}/3 - Waiting for finger on scanner...")
-            while True:
-                capture = zkfp2.AcquireFingerprint()
-                template, _ = _normalize_capture(capture)
-                if template:
-                    templates.append(template)
-                    progress_queue.put(f"✅ Finger {i+1}/3 captured successfully! Please lift your finger.")
-                    break
-        progress_queue.put("🔄 Processing captured fingerprint...")
-        live_template, _ = zkfp2.DBMerge(*templates)
-        progress_queue.put("🔍 Comparing fingerprints...")
-        match_result = zkfp2.DBMatch(stored_template, live_template)
+        _setup_zkfp(zkfp2, progress_queue)
+        progress_queue.put("Device connected successfully")
+        progress_queue.put("Place finger on scanner...")
+        live_template = None
+        while True:
+            capture = zkfp2.AcquireFingerprint()
+            template, _ = _normalize_capture(capture)
+            if template:
+                live_template = template
+                progress_queue.put("Fingerprint captured. Comparing...")
+                break
+        match_result = _db_match_templates(zkfp2, stored_template, live_template)
         try:
             zkfp2.Terminate()
         except Exception:
@@ -173,3 +255,38 @@ def _match_worker_process(progress_queue, result_queue, stored_template_b64):
         result_queue.put(("ok", match_result > 0))
     except Exception as e:
         result_queue.put(("error", str(e)))
+
+
+def _sequential_match_worker_process(progress_queue, result_queue, live_template_b64, records):
+    """Compare live template against a batch; return best-scoring record on this page."""
+    zkfp2 = None
+    try:
+        from pyzkfp import ZKFP2
+        live_template = base64.b64decode(live_template_b64)
+        zkfp2 = ZKFP2()
+        _setup_zkfp(zkfp2, progress_queue)
+        total = len(records)
+        best_score = 0
+        best_record = None
+        for index, record in enumerate(records, start=1):
+            progress_queue.put(f"Comparing {index}/{total} on this page...")
+            template_b64 = record.get("template")
+            if not template_b64:
+                continue
+            try:
+                stored_template = base64.b64decode(template_b64)
+            except Exception:
+                continue
+            score = _db_match_templates(zkfp2, stored_template, live_template)
+            if score > best_score:
+                best_score = score
+                best_record = record
+        result_queue.put(("ok", {"record": best_record, "score": best_score}))
+    except Exception as e:
+        result_queue.put(("error", str(e)))
+    finally:
+        if zkfp2 is not None:
+            try:
+                zkfp2.Terminate()
+            except Exception:
+                pass

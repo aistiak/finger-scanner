@@ -1,4 +1,12 @@
 {
-  "server_url": "http://rtmsbd.com",
-  "last_updated": "2026-02-12T18:52:59.851977"
+  "server_url": "https://rtmsbd.com",
+  "last_updated": "2026-07-25T00:24:49.727755",
+  "remembered_user": {
+    "name": "sample collector test",
+    "email": "sample@gmail.com",
+    "phone_number": "",
+    "role": "phlebotomist",
+    "branch_id": 37
+  },
+  "branch_id": 37
 }

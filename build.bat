@@ -1,24 +1,49 @@
 @echo off
-echo Installing PyInstaller if not already installed...
-pip install pyinstaller
+setlocal
+cd /d "%~dp0"
 
-REM Close existing exe so PyInstaller can overwrite it (avoids "Access is denied")
-tasklist /FI "IMAGENAME eq FingerprintApp.exe" 2>nul | find /I "FingerprintApp.exe" >nul && (
-    echo.
-    echo FingerprintApp.exe is running. Stopping it so the build can replace the file...
-    taskkill /F /IM FingerprintApp.exe >nul 2>&1
-    timeout /t 2 /nobreak >nul
-)
-if exist "dist\FingerprintApp.exe" (
-    del /F /Q "dist\FingerprintApp.exe" 2>nul || (
-        echo.
-        echo Could not remove dist\FingerprintApp.exe - close any program using it then press any key.
-        pause >nul
+echo RTMS Biometric App - Windows build
+echo.
+
+if not exist "venv\Scripts\python.exe" (
+    echo Creating virtual environment...
+    python -m venv venv
+    if errorlevel 1 (
+        echo Failed to create venv. Install Python 3 and try again.
+        pause
+        exit /b 1
     )
 )
 
-echo Building Fingerprint Registration System...
-pyinstaller --noconfirm fingerprint_app.spec
+echo Activating venv and installing dependencies...
+call venv\Scripts\activate.bat
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+if errorlevel 1 (
+    echo pip install failed.
+    pause
+    exit /b 1
+)
 
-echo Build complete! Check the 'dist' folder for FingerprintApp.exe
+tasklist /FI "IMAGENAME eq FingerprintApp.exe" 2>nul | find /I "FingerprintApp.exe" >nul && (
+    echo Stopping running FingerprintApp.exe...
+    taskkill /F /IM FingerprintApp.exe >nul 2>&1
+    timeout /t 2 /nobreak >nul
+)
+if exist "dist\FingerprintApp.exe" del /F /Q "dist\FingerprintApp.exe" 2>nul
+
+echo Building executable with PyInstaller...
+pyinstaller --noconfirm fingerprint_app.spec
+if errorlevel 1 (
+    echo Build failed.
+    pause
+    exit /b 1
+)
+
+if exist "dist\app_settings.json" del /F /Q "dist\app_settings.json" >nul 2>&1
+copy /Y "app_settings.json" "dist\app_settings.json" >nul
+
+echo.
+echo Done: dist\FingerprintApp.exe
+echo Copy dist\FingerprintApp.exe and dist\app_settings.json together when deploying.
 pause
