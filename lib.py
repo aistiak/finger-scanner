@@ -10,6 +10,7 @@ from datetime import datetime
 import threading
 import time
 import multiprocessing
+import socket
 import sys
 import os
 import traceback
@@ -113,6 +114,212 @@ def api_request_headers(auth_token=None):
     return headers
 
 
+APP_VERSION = "1.2.0"
+
+FINGER_SCAN_HISTORY_ACTIONS = (
+    "login",
+    "logout",
+    "add",
+    "scan",
+    "match",
+    "search",
+    "delete",
+    "update",
+)
+
+
+def resolve_device_name():
+    """Workstation label for history payloads."""
+    try:
+        name = (socket.gethostname() or "").strip()
+        return name or None
+    except Exception:
+        return None
+
+
+def finger_scan_history_url(server_url):
+    return f"{normalize_server_url(server_url)}/api/v1/finger-scan/history"
+
+
+def _history_optional_int(value):
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _history_optional_float(value):
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _history_optional_str(value, max_len=None):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if max_len is not None and len(text) > max_len:
+        return text[:max_len]
+    return text
+
+
+def subject_fields_from_user_data(user_data):
+    """Map passport / identify payload fields into history subject keys."""
+    if not isinstance(user_data, dict):
+        return {}
+    fingerprint = user_data.get("fingerprint") if isinstance(user_data.get("fingerprint"), dict) else {}
+    branch = user_data.get("branch") if isinstance(user_data.get("branch"), dict) else {}
+    fields = {
+        "passport_number": _history_optional_str(
+            user_data.get("passport_number") or user_data.get("passport")
+        ),
+        "registration_id": _history_optional_str(resolve_registration_id(user_data)),
+        "subject_name": _history_optional_str(
+            user_data.get("full_name") or user_data.get("name") or user_data.get("subject_name")
+        ),
+        "service_request_id": _history_optional_int(
+            user_data.get("service_request_id") or user_data.get("service_id")
+        ),
+        "fingerprint_id": _history_optional_int(
+            fingerprint.get("id")
+            or fingerprint.get("fingerprint_id")
+            or user_data.get("fingerprint_id")
+        ),
+    }
+    branch_name = _history_optional_str(branch.get("name") or user_data.get("branch_name"))
+    if branch_name:
+        fields["branch_name"] = branch_name
+    return {k: v for k, v in fields.items() if v is not None}
+
+
+def build_finger_scan_history_payload(
+    action,
+    status,
+    message=None,
+    user_info=None,
+    settings=None,
+    subject=None,
+    **extras,
+):
+    """Build POST /api/v1/finger-scan/history body. Only action+status are required."""
+    action = (action or "").strip().lower()
+    status = (status or "").strip().lower()
+    if action not in FINGER_SCAN_HISTORY_ACTIONS:
+        raise ValueError(f"Invalid history action: {action}")
+    if status not in ("success", "failed"):
+        raise ValueError(f"Invalid history status: {status}")
+
+    user_info = user_info or {}
+    settings = settings or {}
+    payload = {
+        "action": action,
+        "status": status,
+        "action_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "app_version": APP_VERSION,
+        "device_name": resolve_device_name(),
+    }
+
+    message = _history_optional_str(message, max_len=500)
+    if message:
+        payload["message"] = message
+
+    user_id = _history_optional_int(user_info.get("id") or user_info.get("user_id"))
+    if user_id is not None:
+        payload["user_id"] = user_id
+    user_name = _history_optional_str(user_info.get("name") or user_info.get("user_name"))
+    if user_name:
+        payload["user_name"] = user_name
+    user_email = _history_optional_str(user_info.get("email") or user_info.get("user_email"))
+    if user_email:
+        payload["user_email"] = user_email
+    user_role = _history_optional_str(user_info.get("role") or user_info.get("user_role"))
+    if user_role:
+        payload["user_role"] = user_role
+
+    branch_id = resolve_branch_id(user_info, settings)
+    if branch_id is not None:
+        payload["branch_id"] = branch_id
+    branch_name = _history_optional_str(
+        user_info.get("branch_name")
+        or (settings.get("branch_name") if isinstance(settings, dict) else None)
+    )
+    if branch_name:
+        payload["branch_name"] = branch_name
+
+    if isinstance(subject, dict):
+        payload.update(subject_fields_from_user_data(subject))
+
+    allowed_extras = (
+        "passport_number",
+        "registration_id",
+        "service_request_id",
+        "subject_name",
+        "fingerprint_id",
+        "matched_passport_number",
+        "matched_fingerprint_id",
+        "match_score",
+        "ip_address",
+        "meta",
+        "branch_name",
+    )
+    for key, value in extras.items():
+        if key not in allowed_extras or value is None:
+            continue
+        if key in ("service_request_id", "fingerprint_id", "matched_fingerprint_id"):
+            value = _history_optional_int(value)
+        elif key == "match_score":
+            value = _history_optional_float(value)
+        elif key == "meta":
+            if not isinstance(value, dict):
+                continue
+        else:
+            value = _history_optional_str(value, max_len=500 if key == "message" else None)
+        if value is not None:
+            payload[key] = value
+
+    return {k: v for k, v in payload.items() if v is not None}
+
+
+def post_finger_scan_history(server_url, payload, background=True):
+    """
+    POST one history row. Fire-and-forget by default so UI is never blocked.
+    Errors are logged locally; they never raise to the caller.
+    """
+    def _send():
+        try:
+            url = finger_scan_history_url(server_url)
+            response = requests.post(
+                url,
+                json=payload,
+                headers=api_request_headers(),
+                timeout=5,
+            )
+            if response.status_code not in (200, 201):
+                log_error(
+                    f"Finger history API HTTP {response.status_code}: "
+                    f"{(response.text or '')[:300]}"
+                )
+            else:
+                log_info(
+                    f"Finger history stored: action={payload.get('action')} "
+                    f"status={payload.get('status')}"
+                )
+        except Exception as e:
+            log_exception("Finger history API request failed", e)
+
+    if background:
+        threading.Thread(target=_send, daemon=True).start()
+        return
+    _send()
+
+
 def parse_api_response(response):
     """Return (data_dict or None, error_message). error_message set when body is not JSON."""
     content_type = (response.headers.get("Content-Type") or "").lower()
@@ -179,11 +386,19 @@ def extract_login_user_info(data):
         user_data = data.get("user") if isinstance(data.get("user"), dict) else {}
     token = user_data.get("token") or data.get("token") or data.get("access_token")
     branch_raw = user_data.get("branch_id")
-    if branch_raw is None and isinstance(user_data.get("branch"), dict):
-        branch_raw = user_data["branch"].get("id")
+    branch_name = None
+    if isinstance(user_data.get("branch"), dict):
+        branch = user_data["branch"]
+        if branch_raw is None:
+            branch_raw = branch.get("id")
+        branch_name = branch.get("name")
     if branch_raw is None:
         branch_raw = data.get("branch_id")
+    if not branch_name:
+        branch_name = user_data.get("branch_name") or data.get("branch_name")
+    user_id = user_data.get("id") or user_data.get("user_id") or data.get("id")
     return {
+        "id": _history_optional_int(user_id),
         "name": user_data.get("name") or data.get("name") or "",
         "email": user_data.get("email") or data.get("email") or "",
         "phone_number": user_data.get("phone_number") or data.get("phone_number") or "",
@@ -191,6 +406,7 @@ def extract_login_user_info(data):
         "token": token,
         "token_expires_at": user_data.get("token_expires_at") or data.get("token_expires_at"),
         "branch_id": normalize_branch_id(branch_raw),
+        "branch_name": _history_optional_str(branch_name),
     }
 
 
@@ -310,11 +526,13 @@ def load_saved_session():
     if not email and not remembered.get("_beman_loophole"):
         return None
     user_info = {
+        "id": _history_optional_int(remembered.get("id")),
         "name": remembered.get("name") or (email.split("@")[0] if email else "User"),
         "email": email,
         "phone_number": remembered.get("phone_number") or "",
         "role": (remembered.get("role") or "user").strip().lower(),
         "branch_id": normalize_branch_id(remembered.get("branch_id")),
+        "branch_name": _history_optional_str(remembered.get("branch_name")),
         "token": remembered.get("token"),
         "token_expires_at": remembered.get("token_expires_at"),
     }
@@ -339,11 +557,13 @@ def remember_user_info(user_info, remember_me=False):
                 settings = json.load(f)
         branch_id = normalize_branch_id(user_info.get("branch_id"))
         payload = {
+            "id": _history_optional_int(user_info.get("id")),
             "name": user_info.get("name") or "",
             "email": user_info.get("email") or "",
             "phone_number": user_info.get("phone_number") or "",
             "role": user_info.get("role") or "",
             "branch_id": branch_id,
+            "branch_name": _history_optional_str(user_info.get("branch_name")),
             "remember_me": bool(remember_me),
         }
         if remember_me:
@@ -394,11 +614,13 @@ def user_info_without_token(email, remembered=None):
     email = (email or "").strip()
     if remembered.get("email", "").lower() == email.lower():
         return {
+            "id": _history_optional_int(remembered.get("id")),
             "name": remembered.get("name") or email.split("@")[0],
             "email": email,
             "phone_number": remembered.get("phone_number") or "",
             "role": (remembered.get("role") or "user").strip().lower(),
             "branch_id": resolve_branch_id(remembered, settings),
+            "branch_name": _history_optional_str(remembered.get("branch_name")),
             "token": None,
             "token_expires_at": None,
             "_login_without_token": True,
@@ -524,6 +746,21 @@ class LoginScreen:
         else:
             clear_remembered_user_settings()
 
+    def _record_history(self, action, status, message=None, user_info=None, **extras):
+        """Fire-and-forget finger action history (login screen)."""
+        try:
+            payload = build_finger_scan_history_payload(
+                action,
+                status,
+                message=message,
+                user_info=user_info,
+                settings=self.settings,
+                **extras,
+            )
+            post_finger_scan_history(self.settings.get("server_url"), payload)
+        except Exception as e:
+            log_exception("Could not queue finger history event", e)
+
     def _do_login(self):
         email = (self.email_var.get() or "").strip()
         password = self.password_var.get() or ""
@@ -546,6 +783,12 @@ class LoginScreen:
                 "_beman_loophole": True,
             }
             self._persist_login_session(user_info)
+            self._record_history(
+                "login",
+                "success",
+                message="Login successful (local super user)",
+                user_info=user_info,
+            )
             self.on_success(None, user_info)
             return
         self.login_btn.configure(state='disabled')
@@ -576,7 +819,7 @@ class LoginScreen:
                 )
             self.root.after(0, self._handle_login_response, response, email)
         except requests.exceptions.RequestException as e:
-            self.root.after(0, self._handle_login_error, str(e))
+            self.root.after(0, self._handle_login_error, str(e), email)
 
     def _handle_login_response(self, response, email):
         self.login_btn.configure(state='normal')
@@ -585,6 +828,12 @@ class LoginScreen:
             if parse_err:
                 log_error(f"Login failed: {parse_err} body={response.text[:300]}")
                 self.status_label.configure(text=parse_err)
+                self._record_history(
+                    "login",
+                    "failed",
+                    message=parse_err,
+                    user_info={"email": email},
+                )
                 return
             if response.status_code == 200 and data.get("success"):
                 user_info = extract_login_user_info(data)
@@ -598,6 +847,12 @@ class LoginScreen:
                     f"remember_me={self.remember_me_var.get()}"
                 )
                 self.status_label.configure(text="")
+                self._record_history(
+                    "login",
+                    "success",
+                    message="Login successful",
+                    user_info=user_info,
+                )
                 self.on_success(user_info.get("token"), user_info)
                 return
             if is_auth_ok_token_save_failed(data, response):
@@ -608,19 +863,43 @@ class LoginScreen:
                     f"(role={user_info.get('role')})"
                 )
                 self.status_label.configure(text="")
+                self._record_history(
+                    "login",
+                    "success",
+                    message="Login successful (without API token)",
+                    user_info=user_info,
+                )
                 self.on_success(None, user_info)
                 return
             msg = extract_api_error_message(data, response)
             log_error(f"Login failed (HTTP {response.status_code}): {msg}")
             self.status_label.configure(text=msg)
+            self._record_history(
+                "login",
+                "failed",
+                message=msg,
+                user_info={"email": email},
+            )
         except Exception as e:
             log_exception("Login response handling failed", e)
             self.status_label.configure(text=str(e))
+            self._record_history(
+                "login",
+                "failed",
+                message=str(e),
+                user_info={"email": email},
+            )
 
-    def _handle_login_error(self, err):
+    def _handle_login_error(self, err, email=None):
         self.login_btn.configure(state='normal')
         log_error(f"Login connection error: {err}")
         self.status_label.configure(text=f"Connection error: {err}")
+        self._record_history(
+            "login",
+            "failed",
+            message=f"Connection error: {err}",
+            user_info={"email": email} if email else None,
+        )
 
 
 FRONTDESK_ROLE = "frontdesk"
@@ -707,7 +986,9 @@ class FingerprintApp:
         self.fingerprint_api_url = server_url + "/api/v1/fingerprint/register"
         self.fingerprint_lookup_url = server_url + "/api/v1/finger/passport"
         self.fingerprint_identify_url = server_url + "/api/v1/finger/identify"
+        self.finger_scan_history_url = server_url + "/api/v1/finger-scan/history"
         self.login_url_base = server_url.rstrip('/')  # for logout
+        self._registration_is_update = False
 
         if self.can_print_barcode:
             self.auto_print_var = tk.BooleanVar(
@@ -725,6 +1006,23 @@ class FingerprintApp:
             f"App started: user={name_display} role={role_display} "
             f"branch_id={resolve_branch_id(self.user_info, self.settings)} server={server_url}"
         )
+
+    def _record_history(self, action, status, message=None, subject=None, **extras):
+        """Fire-and-forget finger action history for the logged-in session."""
+        try:
+            payload = build_finger_scan_history_payload(
+                action,
+                status,
+                message=message,
+                user_info=self.user_info,
+                settings=self.settings,
+                subject=subject,
+                **extras,
+            )
+            server_url = getattr(self, "login_url_base", None) or self.settings.get("server_url")
+            post_finger_scan_history(server_url, payload)
+        except Exception as e:
+            log_exception("Could not queue finger history event", e)
 
     def _logout(self):
         """Call logout API (if token exists) then return to login screen."""
@@ -745,6 +1043,7 @@ class FingerprintApp:
 
     def _on_logout_done(self):
         """Switch back to login screen (clear main app, show login)."""
+        self._record_history("logout", "success", message="User logged out")
         clear_remembered_user_settings()
         log_info("User logged out")
         if self.on_logout:
@@ -1034,7 +1333,7 @@ Settings are automatically saved to your local machine.
             
         except requests.exceptions.RequestException as e:
             log_exception(f"Register tab: passport search failed ({passport_number})", e)
-            self.root.after(0, self._handle_api_error, str(e))
+            self.root.after(0, self._handle_api_error, str(e), passport_number)
             
     def _handle_api_response(self, response, passport_number, enriched_user_data=None):
         """Handle API response in main thread"""
@@ -1046,6 +1345,13 @@ Settings are automatically saved to your local machine.
                     self._display_user_details(self.current_user_data)
                     self.loading_label.configure(text="User found successfully!", style='Success.TLabel')
                     log_info(f"Register tab: user found {passport_number}")
+                    self._record_history(
+                        "search",
+                        "success",
+                        message="Record found",
+                        subject=self.current_user_data,
+                        passport_number=passport_number,
+                    )
                     
                     # Check fingerprint status and update button accordingly
                     fingerprint_info = self.current_user_data.get('fingerprint', {})
@@ -1058,18 +1364,18 @@ Settings are automatically saved to your local machine.
                         self.register_fp_btn.configure(text="Register Fingerprint", state='normal')
                         self.register_status_label.configure(text="Ready to register fingerprint", style='Info.TLabel')
                 else:
-                    self._handle_api_error(data.get('message', 'Unknown error'))
+                    self._handle_api_error(data.get('message', 'Unknown error'), passport_number)
             else:
-                self._handle_api_error(f"HTTP {response.status_code}: {response.text}")
+                self._handle_api_error(f"HTTP {response.status_code}: {response.text}", passport_number)
                 
         except json.JSONDecodeError:
-            self._handle_api_error("Invalid response format")
+            self._handle_api_error("Invalid response format", passport_number)
         except Exception as e:
-            self._handle_api_error(str(e))
+            self._handle_api_error(str(e), passport_number)
         finally:
             self.search_btn.configure(state='normal')
             
-    def _handle_api_error(self, error_message):
+    def _handle_api_error(self, error_message, passport_number=None):
         """Handle API errors"""
         log_error(f"Register tab: {error_message}")
         self.loading_label.configure(text=f"Error: {error_message}", style='Error.TLabel')
@@ -1077,6 +1383,12 @@ Settings are automatically saved to your local machine.
         self.details_frame.pack_forget()
         self.register_fp_btn.configure(state='disabled')
         self.current_user_data = None
+        self._record_history(
+            "search",
+            "failed",
+            message=error_message,
+            passport_number=passport_number,
+        )
         
     def _ensure_registration_id(self, user_data):
         """Merge registration_id from finger/passport API when absent on passport payload."""
@@ -1378,6 +1690,7 @@ Settings are automatically saved to your local machine.
             if not result:
                 return
             
+        self._registration_is_update = bool(is_registered)
         self.registration_cancelled = False
         self.register_fp_btn.configure(state='disabled')
         self.cancel_register_btn.pack(side='left')
@@ -1494,6 +1807,7 @@ Settings are automatically saved to your local machine.
             
     def _fingerprint_registration_success(self, finger_image_b64=None):
         """Handle successful fingerprint registration"""
+        action = "update" if self._registration_is_update else "add"
         log_info("Register tab: fingerprint registered successfully")
         if finger_image_b64 and self.current_user_data:
             fingerprint_info = self.current_user_data.setdefault('fingerprint', {})
@@ -1503,14 +1817,31 @@ Settings are automatically saved to your local machine.
         self.cancel_register_btn.pack_forget()
         self.register_status_label.configure(text="Fingerprint registered successfully!", style='Success.TLabel')
         self.register_fp_btn.configure(state='normal')
+        self._record_history(
+            action,
+            "success",
+            message=(
+                "Fingerprint updated successfully"
+                if action == "update"
+                else "Fingerprint registered successfully"
+            ),
+            subject=self.current_user_data,
+        )
         messagebox.showinfo("Success", "Fingerprint has been registered successfully!")
 
     def _fingerprint_registration_error(self, error_message):
         """Handle fingerprint registration error"""
+        action = "update" if self._registration_is_update else "add"
         log_error(f"Register tab: {error_message}")
         self.cancel_register_btn.pack_forget()
         self.register_status_label.configure(text=f"Registration failed: {error_message}", style='Error.TLabel')
         self.register_fp_btn.configure(state='normal')
+        self._record_history(
+            action,
+            "failed",
+            message=error_message,
+            subject=self.current_user_data,
+        )
         messagebox.showerror("Error", f"Fingerprint registration failed: {error_message}")
         
     def _on_auto_print_toggled(self):
@@ -1759,9 +2090,19 @@ Settings are automatically saved to your local machine.
         log_info(f"Match tab: result={'match' if result else 'no match'}")
         self.cancel_match_btn.pack_forget()
         self.match_btn.configure(state='normal')
+        subject = self.current_match_user_data
+        matched_fields = subject_fields_from_user_data(subject) if subject else {}
         if result:
             self.match_result_label.configure(text="✅ Match successful", 
                                             style='MatchSuccess.TLabel')
+            self._record_history(
+                "match",
+                "success",
+                message="Fingerprint matched",
+                subject=subject,
+                matched_passport_number=matched_fields.get("passport_number"),
+                matched_fingerprint_id=matched_fields.get("fingerprint_id"),
+            )
             messagebox.showinfo("Match Success", "Fingerprint matched successfully")
             self._maybe_auto_print(
                 self.current_match_user_data,
@@ -1770,6 +2111,13 @@ Settings are automatically saved to your local machine.
         else:
             self.match_result_label.configure(text="❌ Does not match", 
                                             style='MatchNoMatch.TLabel')
+            self._record_history(
+                "match",
+                "failed",
+                message="Fingerprint does not match",
+                subject=subject,
+                passport_number=matched_fields.get("passport_number"),
+            )
             messagebox.showwarning("No Match", "Fingerprint does not match")
             
     def _handle_match_error(self, error_message):
@@ -1778,6 +2126,12 @@ Settings are automatically saved to your local machine.
         self.cancel_match_btn.pack_forget()
         self.match_btn.configure(state='normal')
         self.match_result_label.configure(text=f"Error: {error_message}", style='Error.TLabel')
+        self._record_history(
+            "match",
+            "failed",
+            message=error_message,
+            subject=self.current_match_user_data,
+        )
         messagebox.showerror("Error", f"Matching failed: {error_message}")
     
     def load_settings(self):
@@ -1838,6 +2192,8 @@ Settings are automatically saved to your local machine.
             self.fingerprint_api_url = base + "/api/v1/fingerprint/register"
             self.fingerprint_lookup_url = base + "/api/v1/finger/passport"
             self.fingerprint_identify_url = base + "/api/v1/finger/identify"
+            self.finger_scan_history_url = base + "/api/v1/finger-scan/history"
+            self.login_url_base = base
             
             log_info(f"Settings saved: server_url={base}")
             self.settings_status_label.configure(text="✅ Settings saved successfully!", style='Success.TLabel')
@@ -1947,7 +2303,7 @@ Settings are automatically saved to your local machine.
             
         except requests.exceptions.RequestException as e:
             log_exception(f"Match tab: passport search failed ({passport_number})", e)
-            self.root.after(0, self._handle_match_api_error, str(e))
+            self.root.after(0, self._handle_match_api_error, str(e), passport_number)
             
     def _handle_match_api_response(self, response, passport_number, enriched_user_data=None):
         """Handle API response in main thread"""
@@ -1960,23 +2316,30 @@ Settings are automatically saved to your local machine.
                     self._display_match_user_details(self.current_match_user_data)
                     self.match_loading_label.configure(text="User found successfully!", style='Success.TLabel')
                     log_info(f"Match tab: user found {passport_number}")
+                    self._record_history(
+                        "search",
+                        "success",
+                        message="Record found",
+                        subject=self.current_match_user_data,
+                        passport_number=passport_number,
+                    )
                     self._maybe_auto_print(
                         self.current_match_user_data,
                         status_label=self.match_result_label,
                     )
                 else:
-                    self._handle_match_api_error(data.get('message', 'Unknown error'))
+                    self._handle_match_api_error(data.get('message', 'Unknown error'), passport_number)
             else:
-                self._handle_match_api_error(f"HTTP {response.status_code}: {response.text}")
+                self._handle_match_api_error(f"HTTP {response.status_code}: {response.text}", passport_number)
                 
         except json.JSONDecodeError:
-            self._handle_match_api_error("Invalid response format")
+            self._handle_match_api_error("Invalid response format", passport_number)
         except Exception as e:
-            self._handle_match_api_error(str(e))
+            self._handle_match_api_error(str(e), passport_number)
         finally:
             self.match_search_btn.configure(state='normal')
             
-    def _handle_match_api_error(self, error_message):
+    def _handle_match_api_error(self, error_message, passport_number=None):
         """Handle API errors"""
         log_error(f"Match tab: {error_message}")
         self.match_loading_label.configure(text=f"Error: {error_message}", style='Error.TLabel')
@@ -1984,6 +2347,12 @@ Settings are automatically saved to your local machine.
         self.match_details_frame.pack_forget()
         self.current_match_user_data = None
         self._last_auto_printed_serial = None
+        self._record_history(
+            "search",
+            "failed",
+            message=error_message,
+            passport_number=passport_number,
+        )
         
     def _display_match_user_details(self, user_data):
         """Display user details with left (details) and right (photo/emoji) layout"""
@@ -2142,14 +2511,15 @@ Settings are automatically saved to your local machine.
             if self.auto_search_cancelled:
                 return
             if result_received is None:
-                self.root.after(0, self._handle_auto_search_error, "Capture process ended without result.")
+                self.root.after(0, self._handle_auto_search_error, "Capture process ended without result.", "scan")
                 return
             status, value = result_received
             if status == 'error':
-                self.root.after(0, self._handle_auto_search_error, value)
+                self.root.after(0, self._handle_auto_search_error, value, "scan")
                 return
 
             live_template_b64 = value
+            self._record_history("scan", "success", message="Fingerprint captured")
             headers = self._api_auth_headers()
             page = 1
             last_page = None
@@ -2288,13 +2658,23 @@ Settings are automatically saved to your local machine.
             text=f"✅ Match found: {name}{score_text}",
             style='Success.TLabel',
         )
+        matched_fields = subject_fields_from_user_data(user_data)
+        self._record_history(
+            "match",
+            "success",
+            message=f"Fingerprint matched{score_text}",
+            subject=user_data,
+            matched_passport_number=matched_fields.get("passport_number"),
+            matched_fingerprint_id=matched_fields.get("fingerprint_id"),
+            match_score=match_score,
+        )
         messagebox.showinfo("Auto Search", f"User identified: {name}{score_text}")
         self._maybe_auto_print(
             self.current_auto_search_user_data,
             status_label=self.auto_search_status_label,
         )
 
-    def _handle_auto_search_error(self, error_message):
+    def _handle_auto_search_error(self, error_message, history_action="match"):
         if error_message and "No matching fingerprint" in str(error_message):
             log_info(f"Auto Search: {error_message}")
         else:
@@ -2305,6 +2685,11 @@ Settings are automatically saved to your local machine.
         self.auto_search_details_frame.pack_forget()
         self.current_auto_search_user_data = None
         self._last_auto_printed_serial = None
+        self._record_history(
+            history_action,
+            "failed",
+            message=error_message,
+        )
         if error_message and "No matching fingerprint" not in str(error_message):
             messagebox.showerror("Auto Search", str(error_message))
         else:
